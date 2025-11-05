@@ -20,7 +20,6 @@
 #define MAX_ZOMBIES         (16)
 #define LOOT_POINT_COUNT    (20)
 
-#define INVALID_ACTOR_ID    (-1)
 
 enum E_ITEM_TYPE
 {
@@ -125,7 +124,7 @@ enum E_LOOT_DATA
     Float:lootY,
     Float:lootZ,
     lootPickup,
-    lootItem,
+    E_ITEM_TYPE:lootItem,
     bool:lootActive
 };
 
@@ -169,8 +168,8 @@ stock ResetPlayerSurvivalData(playerid)
     gPlayerThirstWarned[playerid] = false;
     gPlayerInfectionWarned[playerid] = false;
 
-    for (new item = 0; item < ITEM_COUNT; item++)
-        gPlayerInventory[playerid][item] = 0;
+    for (new i = 0; i < _:ITEM_COUNT; i++)
+        gPlayerInventory[playerid][i] = 0;
 
     gPlayerInventory[playerid][ITEM_WATER] = 1;
     gPlayerInventory[playerid][ITEM_FOOD] = 1;
@@ -186,7 +185,7 @@ stock GetItemName(E_ITEM_TYPE:item, dest[], len)
         return 1;
     }
 
-    format(dest, len, "%s", gItemNames[item]);
+    format(dest, len, "%s", gItemNames[_:item]);
     return 1;
 }
 
@@ -209,7 +208,7 @@ stock E_ITEM_TYPE:GetItemTypeFromString(const input[])
     return ITEM_NONE;
 }
 
-stock RandomLootItem()
+stock E_ITEM_TYPE:RandomLootItem()
 {
     new roll = random(100);
     if (roll < 25) return ITEM_WATER;
@@ -226,11 +225,11 @@ stock CreateLootAtIndex(index)
     if (index < 0 || index >= LOOT_POINT_COUNT)
         return 0;
 
-    new item = RandomLootItem();
+    new E_ITEM_TYPE:item = RandomLootItem();
     gLootPoints[index][lootItem] = item;
     gLootPoints[index][lootActive] = true;
 
-    new model = gItemModels[item];
+    new model = gItemModels[_:item];
     if (!model) model = 1279;
 
     gLootPoints[index][lootPickup] = CreatePickup(model, 2, gLootPoints[index][lootX], gLootPoints[index][lootY], gLootPoints[index][lootZ], -1);
@@ -326,21 +325,21 @@ stock BuildInventoryString(playerid, dest[], len)
     dest[0] = '\0';
     new bool:first = true;
 
-    for (new item = 1; item < ITEM_COUNT; item++)
+    for (new E_ITEM_TYPE:item = ITEM_WATER; item < ITEM_COUNT; item++)
     {
-        if (gPlayerInventory[playerid][item] > 0)
+        if (gPlayerInventory[playerid][_:(item)] > 0)
         {
             new itemName[32];
             GetItemName(E_ITEM_TYPE:item, itemName, sizeof(itemName));
 
             if (first)
             {
-                format(dest, len, "%s x%d", itemName, gPlayerInventory[playerid][item]);
+                format(dest, len, "%s x%d", itemName, gPlayerInventory[playerid][_:(item)]);
                 first = false;
             }
             else
             {
-                format(dest, len, "%s, %s x%d", dest, itemName, gPlayerInventory[playerid][item]);
+                format(dest, len, "%s, %s x%d", dest, itemName, gPlayerInventory[playerid][_:(item)]);
             }
         }
     }
@@ -356,10 +355,10 @@ stock bool:TakeInventoryItem(playerid, E_ITEM_TYPE:item)
     if (item <= ITEM_NONE || item >= ITEM_COUNT)
         return false;
 
-    if (gPlayerInventory[playerid][item] <= 0)
+    if (gPlayerInventory[playerid][_:(item)] <= 0)
         return false;
 
-    gPlayerInventory[playerid][item]--;
+    gPlayerInventory[playerid][_:(item)]--;
     return true;
 }
 
@@ -368,14 +367,14 @@ stock GiveInventoryItem(playerid, E_ITEM_TYPE:item, amount)
     if (item <= ITEM_NONE || item >= ITEM_COUNT)
         return 0;
 
-    gPlayerInventory[playerid][item] += amount;
+    gPlayerInventory[playerid][_:(item)] += amount;
     return 1;
 }
 
 stock HandlePlayerDeath(playerid)
 {
-    for (new item = 0; item < ITEM_COUNT; item++)
-        gPlayerInventory[playerid][item] = 0;
+    for (new i = 0; i < _:ITEM_COUNT; i++)
+        gPlayerInventory[playerid][i] = 0;
 
     gPlayerBleeding[playerid] = false;
     gPlayerBleedWarned[playerid] = false;
@@ -471,7 +470,7 @@ public OnPlayerSpawn(playerid)
     SetPlayerPos(playerid, gSurvivorSpawns[spawnIndex][0], gSurvivorSpawns[spawnIndex][1], gSurvivorSpawns[spawnIndex][2]);
     SetPlayerFacingAngle(playerid, gSurvivorSpawns[spawnIndex][3]);
     SetPlayerHealth(playerid, 100.0);
-    SetPlayerArmor(playerid, 0.0);
+    SetPlayerArmour(playerid, 0.0);
     ResetPlayerWeapons(playerid);
 
     GiveStarterNotification(playerid);
@@ -603,14 +602,14 @@ public OnPlayerPickUpPickup(playerid, pickupid)
 
         if (gLootPoints[i][lootPickup] == pickupid)
         {
-            new item = gLootPoints[i][lootItem];
+            new E_ITEM_TYPE:item = gLootPoints[i][lootItem];
             if (item <= ITEM_NONE || item >= ITEM_COUNT)
                 return 1;
 
-            GiveInventoryItem(playerid, E_ITEM_TYPE:item, 1);
+            GiveInventoryItem(playerid, item, 1);
 
             new itemName[32];
-            GetItemName(E_ITEM_TYPE:item, itemName, sizeof(itemName));
+            GetItemName(item, itemName, sizeof(itemName));
 
             new message[96];
             format(message, sizeof(message), "Вы нашли %s", itemName);
@@ -624,7 +623,7 @@ public OnPlayerPickUpPickup(playerid, pickupid)
     return 1;
 }
 
-public OnPlayerTakeDamage(playerid, issuerid, Float:amount, weaponid, bodypart)
+public OnPlayerTakeDamage(playerid, issuerid, Float:amount, WEAPON:weaponid, bodypart)
 {
     if (amount >= 15.0 && !gPlayerBleeding[playerid] && random(100) < 40)
     {
@@ -640,6 +639,10 @@ stock ApplyItemUsage(playerid, E_ITEM_TYPE:item)
 {
     switch (item)
     {
+        case ITEM_NONE:
+        {
+            SendClientMessage(playerid, COLOR_WARNING, "Предмет не найден.");
+        }
         case ITEM_WATER:
         {
             gPlayerThirst[playerid] = ClampFloat(gPlayerThirst[playerid] + 45.0, 0.0, 100.0);
@@ -679,8 +682,8 @@ stock ApplyItemUsage(playerid, E_ITEM_TYPE:item)
         }
         case ITEM_AMMO:
         {
-            new weapon = GetPlayerWeapon(playerid);
-            if (weapon == 0 || weapon == WEAPON_FIST)
+            new WEAPON:weapon = GetPlayerWeapon(playerid);
+            if (weapon == WEAPON:0 || weapon == WEAPON_FIST)
             {
                 GivePlayerWeapon(playerid, WEAPON_COLT45, 30);
                 SendClientMessage(playerid, COLOR_ACTION, "Вы нашли старый пистолет вместе с патронами.");
@@ -712,6 +715,10 @@ stock ApplyItemUsage(playerid, E_ITEM_TYPE:item)
             CreateExplosion(x, y, z, 3, 2.0);
             SendClientMessage(playerid, COLOR_ACTION, "Вы подожгли сигнальную шашку, зомби услышали шум!");
         }
+        default:
+        {
+            SendClientMessage(playerid, COLOR_WARNING, "Этот предмет пока нельзя использовать.");
+        }
     }
     return 1;
 }
@@ -724,8 +731,8 @@ public SurvivalTick()
         if (!IsPlayerConnected(playerid))
             continue;
 
-        new state = GetPlayerState(playerid);
-        if (state != PLAYER_STATE_ONFOOT && state != PLAYER_STATE_DRIVER && state != PLAYER_STATE_PASSENGER)
+        new playerState = GetPlayerState(playerid);
+        if (playerState != PLAYER_STATE_ONFOOT && playerState != PLAYER_STATE_DRIVER && playerState != PLAYER_STATE_PASSENGER)
             continue;
 
         gPlayerHunger[playerid] = ClampFloat(gPlayerHunger[playerid] - 2.0, 0.0, 100.0);
