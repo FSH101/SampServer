@@ -6,6 +6,7 @@
 */
 
 #include <open.mp>
+#include <file>
 
 #define COLOR_INFO          (0xA0D0FFFF)
 #define COLOR_WARNING       (0xFF9900FF)
@@ -19,6 +20,14 @@
 
 #define MAX_ZOMBIES         (16)
 #define LOOT_POINT_COUNT    (20)
+
+#define ACCOUNT_DIRECTORY           "Accounts"
+#define ACCOUNT_PASSWORD_MIN_LENGTH (4)
+#define ACCOUNT_PASSWORD_MAX_LENGTH (32)
+#define ACCOUNT_FILE_EXTENSION      ".ini"
+
+#define DIALOG_ACCOUNT_LOGIN    (1000)
+#define DIALOG_ACCOUNT_REGISTER (1001)
 
 
 enum E_ITEM_TYPE
@@ -143,11 +152,296 @@ new bool:gPlayerHungryWarned[MAX_PLAYERS];
 new bool:gPlayerThirstWarned[MAX_PLAYERS];
 new bool:gPlayerInfectionWarned[MAX_PLAYERS];
 new gPlayerInventory[MAX_PLAYERS][ITEM_COUNT];
+new bool:gPlayerLogged[MAX_PLAYERS];
+new bool:gPlayerDataLoaded[MAX_PLAYERS];
+new bool:gPlayerNeedsFreshStart[MAX_PLAYERS];
+new gPlayerPassword[MAX_PLAYERS][ACCOUNT_PASSWORD_MAX_LENGTH];
+new gPlayerAccountName[MAX_PLAYERS][MAX_PLAYER_NAME];
+new gPlayerAccountFileName[MAX_PLAYERS][MAX_PLAYER_NAME];
 
 forward SurvivalTick();
 forward ZombieTick();
 forward RespawnLoot(index);
 forward ApplyItemUsage(playerid, E_ITEM_TYPE:item);
+forward bool:SavePlayerAccount(playerid);
+
+// -------------------- Аккаунты --------------------
+stock TrimLineEnding(str[])
+{
+    new len = strlen(str);
+    while (len > 0 && (str[len - 1] == '\n' || str[len - 1] == '\r'))
+    {
+        str[--len] = '\0';
+    }
+    return 1;
+}
+
+stock SanitizeAccountName(const input[], dest[], len)
+{
+    new i;
+    for (i = 0; i < len - 1 && input[i] != '\0'; i++)
+    {
+        new ch = input[i];
+        if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '-')
+        {
+            dest[i] = ch;
+        }
+        else
+        {
+            dest[i] = '_';
+        }
+    }
+
+    if (i == 0)
+    {
+        dest[0] = 'p';
+        dest[1] = 'l';
+        dest[2] = 'a';
+        dest[3] = 'y';
+        dest[4] = 'e';
+        dest[5] = 'r';
+        dest[6] = '\0';
+        return 1;
+    }
+
+    dest[i] = '\0';
+    return 1;
+}
+
+stock BuildAccountPath(playerid, dest[], len)
+{
+    format(dest, len, ACCOUNT_DIRECTORY "/%s" ACCOUNT_FILE_EXTENSION, gPlayerAccountFileName[playerid]);
+    return 1;
+}
+
+stock EnsureAccountDirectory()
+{
+    fmkdir(ACCOUNT_DIRECTORY);
+    return 1;
+}
+
+stock bool:GetAccountPassword(playerid, dest[], len)
+{
+    new path[128];
+    BuildAccountPath(playerid, path, sizeof(path));
+
+    if (!fexist(path))
+        return false;
+
+    new File:file = fopen(path, io_read);
+    if (!file)
+        return false;
+
+    new line[256];
+    while (fread(file, line, sizeof(line)))
+    {
+        TrimLineEnding(line);
+        if (!strncmp(line, "password=", 9))
+        {
+            strmid(dest, line, 9, strlen(line), len);
+            fclose(file);
+            return true;
+        }
+    }
+
+    fclose(file);
+    return false;
+}
+
+stock ParseInventoryString(playerid, const data[])
+{
+    new len = strlen(data);
+    new start = 0;
+    new token[16];
+
+    for (new E_ITEM_TYPE:item = ITEM_NONE; item < ITEM_COUNT; item++)
+    {
+        if (start > len)
+        {
+            gPlayerInventory[playerid][item] = 0;
+            continue;
+        }
+
+        new end = start;
+        while (end <= len && data[end] != ',' && data[end] != '\0')
+            end++;
+
+        new copyLength = end - start;
+        if (copyLength >= sizeof(token))
+            copyLength = sizeof(token) - 1;
+
+        strmid(token, data, start, start + copyLength, sizeof(token));
+        token[copyLength] = '\0';
+
+        gPlayerInventory[playerid][item] = strval(token);
+        start = end + 1;
+    }
+    return 1;
+}
+
+stock BuildInventoryStringForSave(playerid, dest[], len)
+{
+    dest[0] = '\0';
+
+    new entry[16];
+    for (new E_ITEM_TYPE:item = ITEM_NONE; item < ITEM_COUNT; item++)
+    {
+        format(entry, sizeof(entry), "%d", gPlayerInventory[playerid][item]);
+
+        if (dest[0] != '\0')
+        {
+            strcat(dest, ",", len);
+        }
+
+        strcat(dest, entry, len);
+    }
+    return 1;
+}
+
+stock bool:LoadPlayerAccount(playerid)
+{
+    new path[128];
+    BuildAccountPath(playerid, path, sizeof(path));
+
+    if (!fexist(path))
+        return false;
+
+    new File:file = fopen(path, io_read);
+    if (!file)
+        return false;
+
+    ResetPlayerSurvivalData(playerid);
+
+    new line[256];
+    while (fread(file, line, sizeof(line)))
+    {
+        TrimLineEnding(line);
+
+        if (!line[0])
+            continue;
+
+        if (!strncmp(line, "password=", 9))
+        {
+            strmid(gPlayerPassword[playerid], line, 9, strlen(line), ACCOUNT_PASSWORD_MAX_LENGTH);
+        }
+        else if (!strncmp(line, "hunger=", 7))
+        {
+            gPlayerHunger[playerid] = floatstr(line[7]);
+        }
+        else if (!strncmp(line, "thirst=", 7))
+        {
+            gPlayerThirst[playerid] = floatstr(line[7]);
+        }
+        else if (!strncmp(line, "bleeding=", 9))
+        {
+            gPlayerBleeding[playerid] = (strval(line[9]) != 0);
+        }
+        else if (!strncmp(line, "bleed_warned=", 13))
+        {
+            gPlayerBleedWarned[playerid] = (strval(line[13]) != 0);
+        }
+        else if (!strncmp(line, "infected=", 9))
+        {
+            gPlayerInfected[playerid] = (strval(line[9]) != 0);
+        }
+        else if (!strncmp(line, "hungry_warned=", 14))
+        {
+            gPlayerHungryWarned[playerid] = (strval(line[14]) != 0);
+        }
+        else if (!strncmp(line, "thirst_warned=", 14))
+        {
+            gPlayerThirstWarned[playerid] = (strval(line[14]) != 0);
+        }
+        else if (!strncmp(line, "infection_warned=", 17))
+        {
+            gPlayerInfectionWarned[playerid] = (strval(line[17]) != 0);
+        }
+        else if (!strncmp(line, "inventory=", 10))
+        {
+            ParseInventoryString(playerid, line[10]);
+        }
+    }
+
+    fclose(file);
+    return true;
+}
+
+stock bool:SavePlayerAccount(playerid)
+{
+    if (!gPlayerLogged[playerid])
+        return false;
+
+    new path[128];
+    BuildAccountPath(playerid, path, sizeof(path));
+
+    new File:file = fopen(path, io_write);
+    if (!file)
+        return false;
+
+    new buffer[256];
+    format(buffer, sizeof(buffer), "password=%s\n", gPlayerPassword[playerid]);
+    fwrite(file, buffer);
+
+    format(buffer, sizeof(buffer), "hunger=%.2f\n", gPlayerHunger[playerid]);
+    fwrite(file, buffer);
+
+    format(buffer, sizeof(buffer), "thirst=%.2f\n", gPlayerThirst[playerid]);
+    fwrite(file, buffer);
+
+    format(buffer, sizeof(buffer), "bleeding=%d\n", gPlayerBleeding[playerid]);
+    fwrite(file, buffer);
+
+    format(buffer, sizeof(buffer), "bleed_warned=%d\n", gPlayerBleedWarned[playerid]);
+    fwrite(file, buffer);
+
+    format(buffer, sizeof(buffer), "infected=%d\n", gPlayerInfected[playerid]);
+    fwrite(file, buffer);
+
+    format(buffer, sizeof(buffer), "hungry_warned=%d\n", gPlayerHungryWarned[playerid]);
+    fwrite(file, buffer);
+
+    format(buffer, sizeof(buffer), "thirst_warned=%d\n", gPlayerThirstWarned[playerid]);
+    fwrite(file, buffer);
+
+    format(buffer, sizeof(buffer), "infection_warned=%d\n", gPlayerInfectionWarned[playerid]);
+    fwrite(file, buffer);
+
+    new inventoryData[256];
+    BuildInventoryStringForSave(playerid, inventoryData, sizeof(inventoryData));
+    format(buffer, sizeof(buffer), "inventory=%s\n", inventoryData);
+    fwrite(file, buffer);
+
+    fclose(file);
+    return true;
+}
+
+stock bool:IsPasswordValid(const password[])
+{
+    new length = strlen(password);
+    return (length >= ACCOUNT_PASSWORD_MIN_LENGTH && length < ACCOUNT_PASSWORD_MAX_LENGTH);
+}
+
+stock ShowAccountLoginDialog(playerid)
+{
+    new caption[64];
+    format(caption, sizeof(caption), "Авторизация (%s)", gPlayerAccountName[playerid]);
+
+    new message[144];
+    format(message, sizeof(message), "Введите пароль для входа в аккаунт %s:", gPlayerAccountName[playerid]);
+    ShowPlayerDialog(playerid, DIALOG_ACCOUNT_LOGIN, DIALOG_STYLE_PASSWORD, caption, message, "Войти", "Выход");
+    return 1;
+}
+
+stock ShowAccountRegisterDialog(playerid)
+{
+    new caption[64];
+    format(caption, sizeof(caption), "Регистрация (%s)", gPlayerAccountName[playerid]);
+
+    new message[160];
+    format(message, sizeof(message), "Придумайте пароль для нового аккаунта %s:\n(минимум %d символа)", gPlayerAccountName[playerid], ACCOUNT_PASSWORD_MIN_LENGTH);
+    ShowPlayerDialog(playerid, DIALOG_ACCOUNT_REGISTER, DIALOG_STYLE_PASSWORD, caption, message, "Создать", "Выход");
+    return 1;
+}
 
 // -------------------- Вспомогательные функции --------------------
 stock Float:ClampFloat(Float:value, Float:minValue, Float:maxValue)
@@ -382,6 +676,7 @@ stock HandlePlayerDeath(playerid)
     gPlayerHungryWarned[playerid] = false;
     gPlayerThirstWarned[playerid] = false;
     gPlayerInfectionWarned[playerid] = false;
+    gPlayerNeedsFreshStart[playerid] = true;
     return 1;
 }
 
@@ -397,6 +692,7 @@ public OnGameModeInit()
 {
     SetGameModeText("DayZ Survival");
     UsePlayerPedAnims();
+    EnsureAccountDirectory();
     ShowPlayerMarkers(PLAYER_MARKERS_MODE_OFF);
     DisableInteriorEnterExits();
     EnableStuntBonusForAll(false);
@@ -442,14 +738,51 @@ public OnGameModeExit()
 public OnPlayerConnect(playerid)
 {
     ResetPlayerSurvivalData(playerid);
-    GiveStarterNotification(playerid);
-    SendClientMessage(playerid, COLOR_INFO, "Используй /status для проверки состояния, /use [предмет] для использования.");
+    gPlayerLogged[playerid] = false;
+    gPlayerDataLoaded[playerid] = false;
+    gPlayerNeedsFreshStart[playerid] = false;
+    gPlayerPassword[playerid][0] = '\0';
+
+    new playerName[MAX_PLAYER_NAME];
+    GetPlayerName(playerid, playerName, sizeof(playerName));
+
+    format(gPlayerAccountName[playerid], sizeof(gPlayerAccountName[]), "%s", playerName);
+    SanitizeAccountName(playerName, gPlayerAccountFileName[playerid], sizeof(gPlayerAccountFileName[]));
+
+    if (!strcmp(gPlayerAccountFileName[playerid], "player", true))
+    {
+        format(gPlayerAccountFileName[playerid], sizeof(gPlayerAccountFileName[]), "player_%d", playerid);
+    }
+
+    TogglePlayerControllable(playerid, false);
+
+    new path[128];
+    BuildAccountPath(playerid, path, sizeof(path));
+
+    if (fexist(path))
+    {
+        ShowAccountLoginDialog(playerid);
+    }
+    else
+    {
+        ShowAccountRegisterDialog(playerid);
+    }
+
+    SendClientMessage(playerid, COLOR_INFO, "Для начала игры войдите в аккаунт. Пароль вводится в появившемся окне.");
     return 1;
 }
 
 public OnPlayerDisconnect(playerid, reason)
 {
-    HandlePlayerDeath(playerid);
+    if (gPlayerLogged[playerid])
+    {
+        SavePlayerAccount(playerid);
+    }
+
+    gPlayerLogged[playerid] = false;
+    gPlayerDataLoaded[playerid] = false;
+    gPlayerNeedsFreshStart[playerid] = false;
+    gPlayerPassword[playerid][0] = '\0';
     return 1;
 }
 
@@ -464,7 +797,16 @@ public OnPlayerRequestClass(playerid, classid)
 
 public OnPlayerSpawn(playerid)
 {
-    ResetPlayerSurvivalData(playerid);
+    new bool:freshStart = false;
+
+    if (!gPlayerLogged[playerid] || gPlayerNeedsFreshStart[playerid] || !gPlayerDataLoaded[playerid])
+    {
+        ResetPlayerSurvivalData(playerid);
+        gPlayerNeedsFreshStart[playerid] = false;
+        gPlayerDataLoaded[playerid] = true;
+        freshStart = true;
+        SavePlayerAccount(playerid);
+    }
 
     new spawnIndex = random(sizeof(gSurvivorSpawns));
     SetPlayerPos(playerid, gSurvivorSpawns[spawnIndex][0], gSurvivorSpawns[spawnIndex][1], gSurvivorSpawns[spawnIndex][2]);
@@ -473,7 +815,10 @@ public OnPlayerSpawn(playerid)
     SetPlayerArmour(playerid, 0.0);
     ResetPlayerWeapons(playerid);
 
-    GiveStarterNotification(playerid);
+    if (freshStart)
+    {
+        GiveStarterNotification(playerid);
+    }
     return 1;
 }
 
@@ -481,11 +826,18 @@ public OnPlayerDeath(playerid, killerid, WEAPON:reason)
 {
     HandlePlayerDeath(playerid);
     SendClientMessage(playerid, COLOR_DANGER, "Вы погибли и потеряли все припасы. Попробуйте ещё раз!");
+    SavePlayerAccount(playerid);
     return 1;
 }
 
 public OnPlayerCommandText(playerid, cmdtext[])
 {
+    if (!gPlayerLogged[playerid])
+    {
+        SendClientMessage(playerid, COLOR_WARNING, "Необходимо войти в аккаунт, чтобы использовать команды.");
+        return 1;
+    }
+
     if (!strcmp(cmdtext, "/status", true))
     {
         ShowPlayerStatus(playerid);
@@ -562,6 +914,7 @@ public OnPlayerCommandText(playerid, cmdtext[])
                 gPlayerInventory[playerid][ITEM_AMMO]--;
                 gPlayerInventory[playerid][ITEM_FLARE]++;
                 SendClientMessage(playerid, COLOR_ACTION, "Вы собрали сигнальную шашку из патронов и инструментов.");
+                SavePlayerAccount(playerid);
             }
             else
             {
@@ -578,6 +931,7 @@ public OnPlayerCommandText(playerid, cmdtext[])
                 gPlayerInventory[playerid][ITEM_FOOD]--;
                 gPlayerInventory[playerid][ITEM_AMMO] += 2;
                 SendClientMessage(playerid, COLOR_ACTION, "Вы собрали самодельные патроны, потратив инструменты и консервы.");
+                SavePlayerAccount(playerid);
             }
             else
             {
@@ -593,8 +947,99 @@ public OnPlayerCommandText(playerid, cmdtext[])
     return 0;
 }
 
+public OnDialogResponse(playerid, dialogid, response, listitem, inputtext[])
+{
+    switch (dialogid)
+    {
+        case DIALOG_ACCOUNT_LOGIN:
+        {
+            if (!response)
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "Авторизация необходима для игры. Введите пароль.");
+                ShowAccountLoginDialog(playerid);
+                return 1;
+            }
+
+            if (!inputtext[0])
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "Пароль не может быть пустым.");
+                ShowAccountLoginDialog(playerid);
+                return 1;
+            }
+
+            new stored[ACCOUNT_PASSWORD_MAX_LENGTH];
+            if (!GetAccountPassword(playerid, stored, sizeof(stored)))
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "Не найден файл аккаунта. Создайте новый пароль.");
+                ShowAccountRegisterDialog(playerid);
+                return 1;
+            }
+
+            if (strcmp(stored, inputtext, false))
+            {
+                SendClientMessage(playerid, COLOR_DANGER, "Неверный пароль. Попробуйте снова.");
+                ShowAccountLoginDialog(playerid);
+                return 1;
+            }
+
+            if (!LoadPlayerAccount(playerid))
+            {
+                ResetPlayerSurvivalData(playerid);
+                format(gPlayerPassword[playerid], ACCOUNT_PASSWORD_MAX_LENGTH, "%s", stored);
+                SavePlayerAccount(playerid);
+            }
+
+            gPlayerLogged[playerid] = true;
+            gPlayerDataLoaded[playerid] = true;
+            gPlayerNeedsFreshStart[playerid] = false;
+
+            TogglePlayerControllable(playerid, true);
+            SendClientMessage(playerid, COLOR_ACTION, "Успешный вход в аккаунт. Удачной охоты!");
+            SendClientMessage(playerid, COLOR_INFO, "Используй /status для проверки состояния, /use [предмет] для использования.");
+            SpawnPlayer(playerid);
+            return 1;
+        }
+        case DIALOG_ACCOUNT_REGISTER:
+        {
+            if (!response)
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "Регистрация необходима для начала игры.");
+                ShowAccountRegisterDialog(playerid);
+                return 1;
+            }
+
+            if (!IsPasswordValid(inputtext))
+            {
+                new message[104];
+                format(message, sizeof(message), "Пароль должен содержать от %d до %d символов.", ACCOUNT_PASSWORD_MIN_LENGTH, ACCOUNT_PASSWORD_MAX_LENGTH - 1);
+                SendClientMessage(playerid, COLOR_WARNING, message);
+                ShowAccountRegisterDialog(playerid);
+                return 1;
+            }
+
+            format(gPlayerPassword[playerid], ACCOUNT_PASSWORD_MAX_LENGTH, "%s", inputtext);
+            gPlayerLogged[playerid] = true;
+            gPlayerDataLoaded[playerid] = true;
+            gPlayerNeedsFreshStart[playerid] = false;
+
+            SavePlayerAccount(playerid);
+
+            TogglePlayerControllable(playerid, true);
+            SendClientMessage(playerid, COLOR_ACTION, "Аккаунт создан. Добро пожаловать в зону выживания!");
+            SendClientMessage(playerid, COLOR_INFO, "Используй /status для проверки состояния, /use [предмет] для использования.");
+            GiveStarterNotification(playerid);
+            SpawnPlayer(playerid);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 public OnPlayerPickUpPickup(playerid, pickupid)
 {
+    if (!gPlayerLogged[playerid])
+        return 1;
+
     for (new i = 0; i < LOOT_POINT_COUNT; i++)
     {
         if (!gLootPoints[i][lootActive])
@@ -617,6 +1062,7 @@ public OnPlayerPickUpPickup(playerid, pickupid)
 
             DestroyLootAtIndex(i);
             SetTimerEx("RespawnLoot", LOOT_RESPAWN_MS, false, "d", i);
+            SavePlayerAccount(playerid);
             return 1;
         }
     }
@@ -630,6 +1076,7 @@ public OnPlayerTakeDamage(playerid, issuerid, Float:amount, WEAPON:weaponid, bod
         gPlayerBleeding[playerid] = true;
         gPlayerBleedWarned[playerid] = true;
         SendClientMessage(playerid, COLOR_DANGER, "Вы получили серьёзную рану и начали истекать кровью. Используйте бинт!");
+        SavePlayerAccount(playerid);
     }
     return 1;
 }
@@ -720,6 +1167,7 @@ stock ApplyItemUsage(playerid, E_ITEM_TYPE:item)
             SendClientMessage(playerid, COLOR_WARNING, "Этот предмет пока нельзя использовать.");
         }
     }
+    SavePlayerAccount(playerid);
     return 1;
 }
 
@@ -729,6 +1177,9 @@ public SurvivalTick()
     for (new playerid = 0; playerid < MAX_PLAYERS; playerid++)
     {
         if (!IsPlayerConnected(playerid))
+            continue;
+
+        if (!gPlayerLogged[playerid])
             continue;
 
         new PLAYER_STATE:playerState = GetPlayerState(playerid);
@@ -813,6 +1264,8 @@ public SurvivalTick()
         {
             SetPlayerHealth(playerid, 0.0);
         }
+
+        SavePlayerAccount(playerid);
     }
     return 1;
 }
@@ -867,6 +1320,8 @@ public ZombieTick()
                     gPlayerInfectionWarned[playerid] = true;
                     SendClientMessage(playerid, COLOR_ZOMBIE, "Вы заражены вирусом. Срочно найдите аптечку!");
                 }
+
+                SavePlayerAccount(playerid);
 
                 GameTextForPlayer(playerid, "~r~Zombie hit!", 1500, 3);
             }
