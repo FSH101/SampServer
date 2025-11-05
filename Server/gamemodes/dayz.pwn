@@ -168,8 +168,8 @@ stock ResetPlayerSurvivalData(playerid)
     gPlayerThirstWarned[playerid] = false;
     gPlayerInfectionWarned[playerid] = false;
 
-    for (new i = 0; i < _:ITEM_COUNT; i++)
-        gPlayerInventory[playerid][i] = 0;
+    for (new E_ITEM_TYPE:item = ITEM_NONE; item < ITEM_COUNT; item++)
+        gPlayerInventory[playerid][item] = 0;
 
     gPlayerInventory[playerid][ITEM_WATER] = 1;
     gPlayerInventory[playerid][ITEM_FOOD] = 1;
@@ -185,7 +185,7 @@ stock GetItemName(E_ITEM_TYPE:item, dest[], len)
         return 1;
     }
 
-    format(dest, len, "%s", gItemNames[_:item]);
+    format(dest, len, "%s", gItemNames[item]);
     return 1;
 }
 
@@ -229,7 +229,7 @@ stock CreateLootAtIndex(index)
     gLootPoints[index][lootItem] = item;
     gLootPoints[index][lootActive] = true;
 
-    new model = gItemModels[_:item];
+    new model = gItemModels[item];
     if (!model) model = 1279;
 
     gLootPoints[index][lootPickup] = CreatePickup(model, 2, gLootPoints[index][lootX], gLootPoints[index][lootY], gLootPoints[index][lootZ], -1);
@@ -327,19 +327,19 @@ stock BuildInventoryString(playerid, dest[], len)
 
     for (new E_ITEM_TYPE:item = ITEM_WATER; item < ITEM_COUNT; item++)
     {
-        if (gPlayerInventory[playerid][_:(item)] > 0)
+        if (gPlayerInventory[playerid][item] > 0)
         {
             new itemName[32];
             GetItemName(E_ITEM_TYPE:item, itemName, sizeof(itemName));
 
             if (first)
             {
-                format(dest, len, "%s x%d", itemName, gPlayerInventory[playerid][_:(item)]);
+                format(dest, len, "%s x%d", itemName, gPlayerInventory[playerid][item]);
                 first = false;
             }
             else
             {
-                format(dest, len, "%s, %s x%d", dest, itemName, gPlayerInventory[playerid][_:(item)]);
+                format(dest, len, "%s, %s x%d", dest, itemName, gPlayerInventory[playerid][item]);
             }
         }
     }
@@ -355,10 +355,10 @@ stock bool:TakeInventoryItem(playerid, E_ITEM_TYPE:item)
     if (item <= ITEM_NONE || item >= ITEM_COUNT)
         return false;
 
-    if (gPlayerInventory[playerid][_:(item)] <= 0)
+    if (gPlayerInventory[playerid][item] <= 0)
         return false;
 
-    gPlayerInventory[playerid][_:(item)]--;
+    gPlayerInventory[playerid][item]--;
     return true;
 }
 
@@ -367,14 +367,14 @@ stock GiveInventoryItem(playerid, E_ITEM_TYPE:item, amount)
     if (item <= ITEM_NONE || item >= ITEM_COUNT)
         return 0;
 
-    gPlayerInventory[playerid][_:(item)] += amount;
+    gPlayerInventory[playerid][item] += amount;
     return 1;
 }
 
 stock HandlePlayerDeath(playerid)
 {
-    for (new i = 0; i < _:ITEM_COUNT; i++)
-        gPlayerInventory[playerid][i] = 0;
+    for (new E_ITEM_TYPE:item = ITEM_NONE; item < ITEM_COUNT; item++)
+        gPlayerInventory[playerid][item] = 0;
 
     gPlayerBleeding[playerid] = false;
     gPlayerBleedWarned[playerid] = false;
@@ -477,7 +477,7 @@ public OnPlayerSpawn(playerid)
     return 1;
 }
 
-public OnPlayerDeath(playerid, killerid, reason)
+public OnPlayerDeath(playerid, killerid, WEAPON:reason)
 {
     HandlePlayerDeath(playerid);
     SendClientMessage(playerid, COLOR_DANGER, "Вы погибли и потеряли все припасы. Попробуйте ещё раз!");
@@ -731,7 +731,7 @@ public SurvivalTick()
         if (!IsPlayerConnected(playerid))
             continue;
 
-        new playerState = GetPlayerState(playerid);
+        new PLAYER_STATE:playerState = GetPlayerState(playerid);
         if (playerState != PLAYER_STATE_ONFOOT && playerState != PLAYER_STATE_DRIVER && playerState != PLAYER_STATE_PASSENGER)
             continue;
 
