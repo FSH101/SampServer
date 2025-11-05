@@ -1,179 +1,881 @@
 /*
-    GunGame + /gpt -> OpenAI (direct HTTPS) — CRASH-FIX
-    ---------------------------------------------------
-    Что изменено, чтобы не падал сервер:
-      1) УБРАЛИ OnRequestFailure полностью — плагин раньше пытался вызывать
-         колбэк с другой сигнатурой и это приводило к крашу. Теперь просто
-         не существует такого паблика — плагин не дергает его.
-      2) НЕ передаем заголовки в RequestsClient — только базовый URL.
-         Раньше второй аргумент мог ломать память в плагине.
-      3) Заголовки (Authorization, Content-Type) передаем ТОЛЬКО в самой
-         RequestJSON(…, body, RequestHeaders(...)).
-      4) Оставили Responses API и читаем output_text — это одна строка без
-         сложного парсинга массивов.
-
-    Использование:
-      /gpt <запрос>     — в игре
-      RCON: gpt <запрос>
-
-    Требуется:
-      - requests.dll (pawn-requests) в plugins/
-      - #include <requests>
-      - Исходящий HTTPS (порт 443) наружу
-      - Валидный OPENAI_API_KEY
+    DayZ Survival Gamemode
+    ----------------------
+    Р‘Р°Р·РѕРІР°СЏ СЂРµР°Р»РёР·Р°С†РёСЏ РІС‹Р¶РёРІР°РЅРёСЏ СЃ СЃРёСЃС‚РµРјРѕР№ Р»СѓС‚Р°, Р·РѕРјР±Рё Рё РїСЂРѕСЃС‚С‹Рј РёРЅРІРµРЅС‚Р°СЂС‘Рј.
+    РЎРѕР·РґР°РЅРѕ СЃРїРµС†РёР°Р»СЊРЅРѕ РґР»СЏ РґРµРјРѕРЅСЃС‚СЂР°С†РёРё РІРѕР·РјРѕР¶РЅРѕСЃС‚РµР№ OpenAI РІ Pawn.
 */
 
-#define MIXED_SPELLINGS
-
 #include <open.mp>
-#include <requests>
 
-#define COLOR_INFO      (0xFFFFFFFF)
+#define COLOR_INFO          (0xA0D0FFFF)
+#define COLOR_WARNING       (0xFF9900FF)
+#define COLOR_DANGER        (0xC72F2FFF)
+#define COLOR_ACTION        (0x6FC040FF)
+#define COLOR_ZOMBIE        (0xBB3333FF)
 
-// ====== НАСТРОЙКИ ======
-#define OPENAI_API_KEY  "sk-ijklmnop1234qrstijklmnop1234qrstijklmnop"
-#define OPENAI_MODEL    "gpt-4o-mini"
+#define SURVIVAL_TICK_MS    (30000)
+#define ZOMBIE_TICK_MS      (2000)
+#define LOOT_RESPAWN_MS     (120000)
 
-// HTTP(S) клиент к OpenAI API (ТОЛЬКО БАЗОВЫЙ URL, без заголовков здесь)
-new RequestsClient:gOpenAI;
+#define MAX_ZOMBIES         (16)
+#define LOOT_POINT_COUNT    (20)
 
-// Успешный JSON-колбэк
-forward OnGptResponse(Request:id, E_HTTP_STATUS:status, Node:node);
+#define INVALID_ACTOR_ID    (-1)
 
+enum E_ITEM_TYPE
+{
+    ITEM_NONE,
+    ITEM_WATER,
+    ITEM_FOOD,
+    ITEM_BANDAGE,
+    ITEM_MEDKIT,
+    ITEM_AMMO,
+    ITEM_TOOLKIT,
+    ITEM_FLARE,
+    ITEM_COUNT
+};
+
+new const gItemNames[ITEM_COUNT][] =
+{
+    "-",
+    "Р‘СѓС‚С‹Р»РєР° РІРѕРґС‹",
+    "РљРѕРЅСЃРµСЂРІС‹",
+    "Р‘РёРЅС‚",
+    "РђРїС‚РµС‡РєР°",
+    "РџР°С‚СЂРѕРЅС‹",
+    "РќР°Р±РѕСЂ РёРЅСЃС‚СЂСѓРјРµРЅС‚РѕРІ",
+    "РЎРёРіРЅР°Р»СЊРЅР°СЏ С€Р°С€РєР°"
+};
+
+new const gItemModels[ITEM_COUNT] =
+{
+    0,
+    1985,
+    2769,
+    1575,
+    1240,
+    2044,
+    2964,
+    18728
+};
+
+static const Float:gSurvivorSpawns[][4] =
+{
+    {-1652.7329, -222.9151, 14.1484, 42.0},
+    {-2085.3325, -101.9431, 35.3203, 180.0},
+    {-2071.4121, 181.7751, 28.3359, 270.0},
+    {-2591.7639, 633.8423, 14.4531, 12.0},
+    {-371.1843, 2229.0244, 43.2656, 98.0},
+    {-211.2641, 2705.6497, 62.6797, 220.0},
+    {1268.4454, 2522.8848, 10.8203, 180.0},
+    {1598.2024, 2198.1802, 10.8203, 270.0},
+    {851.6476, 2031.6818, 12.2969, 180.0},
+    {1283.8474, 2663.9492, 10.8203, 90.0},
+    {2471.6646, -1530.1140, 24.4531, 0.0},
+    {2489.3628, -1347.2213, 28.4419, 320.0}
+};
+
+static const Float:gZombieSpawns[MAX_ZOMBIES][3] =
+{
+    {-1691.3204, 66.1429, 14.1484},
+    {-1667.5123, 443.9118, 7.1875},
+    {-2638.0020, 616.1382, 14.4531},
+    {-2052.0544, 167.2816, 28.3359},
+    {-224.7132, 2714.8125, 62.6953},
+    {-358.3215, 2198.6626, 43.2656},
+    {2022.7842, -1905.2571, 13.5469},
+    {2479.3459, -1352.3564, 28.4419},
+    {1591.1744, 2191.3325, 10.8203},
+    {1274.5272, 2531.0029, 10.8203},
+    {894.2177, 2036.4725, 12.3828},
+    {1289.3048, 2669.4014, 10.8203},
+    {741.3792, 1964.1688, 5.5078},
+    {2762.4753, -2465.3020, 13.6484},
+    {1042.5236, -323.5982, 73.9938},
+    {2345.7820, -1141.9871, 105.2578}
+};
+
+static const Float:gLootPointCoords[LOOT_POINT_COUNT][3] =
+{
+    {-1652.6379, 643.2573, 7.1875},
+    {-1692.4418, -209.8453, 14.1484},
+    {-2643.1277, 637.9819, 14.4531},
+    {-2406.0037, -598.2558, 132.5625},
+    {-2050.1169, 178.5608, 28.3359},
+    {-2075.0947, -98.2346, 35.3203},
+    {-213.5473, 2712.2363, 62.6797},
+    {2734.8210, -2468.5845, 13.6458},
+    {2463.5046, -1528.1971, 23.9922},
+    {1600.5720, 2200.2319, 10.8203},
+    {1265.9648, 2536.6248, 10.8203},
+    {850.2363, 2032.1245, 12.2969},
+    {1051.3323, -313.9924, 73.9938},
+    {2338.1460, -1132.2323, 105.2373},
+    {2090.4521, -1916.8325, 13.5469},
+    {2489.3628, -1347.2213, 28.4419},
+    {1283.8474, 2663.9492, 10.8203},
+    {741.9973, 1967.4421, 5.5078},
+    {-380.2142, 2220.9319, 43.2656},
+    {-128.4512, 2726.7747, 62.6953}
+};
+
+enum E_LOOT_DATA
+{
+    Float:lootX,
+    Float:lootY,
+    Float:lootZ,
+    lootPickup,
+    lootItem,
+    bool:lootActive
+};
+
+new gLootPoints[LOOT_POINT_COUNT][E_LOOT_DATA];
+new gZombieActors[MAX_ZOMBIES];
+
+new gSurvivalTimer = -1;
+new gZombieTimer = -1;
+
+new Float:gPlayerHunger[MAX_PLAYERS];
+new Float:gPlayerThirst[MAX_PLAYERS];
+new bool:gPlayerBleeding[MAX_PLAYERS];
+new bool:gPlayerBleedWarned[MAX_PLAYERS];
+new bool:gPlayerInfected[MAX_PLAYERS];
+new bool:gPlayerHungryWarned[MAX_PLAYERS];
+new bool:gPlayerThirstWarned[MAX_PLAYERS];
+new bool:gPlayerInfectionWarned[MAX_PLAYERS];
+new gPlayerInventory[MAX_PLAYERS][ITEM_COUNT];
+
+forward SurvivalTick();
+forward ZombieTick();
+forward RespawnLoot(index);
+forward ApplyItemUsage(playerid, E_ITEM_TYPE:item);
+
+// -------------------- Р’СЃРїРѕРјРѕРіР°С‚РµР»СЊРЅС‹Рµ С„СѓРЅРєС†РёРё --------------------
+stock Float:ClampFloat(Float:value, Float:minValue, Float:maxValue)
+{
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+}
+
+stock ResetPlayerSurvivalData(playerid)
+{
+    gPlayerHunger[playerid] = 100.0;
+    gPlayerThirst[playerid] = 100.0;
+    gPlayerBleeding[playerid] = false;
+    gPlayerBleedWarned[playerid] = false;
+    gPlayerInfected[playerid] = false;
+    gPlayerHungryWarned[playerid] = false;
+    gPlayerThirstWarned[playerid] = false;
+    gPlayerInfectionWarned[playerid] = false;
+
+    for (new item = 0; item < ITEM_COUNT; item++)
+        gPlayerInventory[playerid][item] = 0;
+
+    gPlayerInventory[playerid][ITEM_WATER] = 1;
+    gPlayerInventory[playerid][ITEM_FOOD] = 1;
+    gPlayerInventory[playerid][ITEM_BANDAGE] = 1;
+    return 1;
+}
+
+stock GetItemName(E_ITEM_TYPE:item, dest[], len)
+{
+    if (item <= ITEM_NONE || item >= ITEM_COUNT)
+    {
+        format(dest, len, "РќРµРёР·РІРµСЃС‚РЅС‹Р№ РїСЂРµРґРјРµС‚");
+        return 1;
+    }
+
+    format(dest, len, "%s", gItemNames[item]);
+    return 1;
+}
+
+stock E_ITEM_TYPE:GetItemTypeFromString(const input[])
+{
+    if (!strcmp(input, "water", true) || !strcmp(input, "РІРѕРґР°", true))
+        return ITEM_WATER;
+    if (!strcmp(input, "food", true) || !strcmp(input, "РµРґР°", true) || !strcmp(input, "РєРѕРЅСЃРµСЂРІС‹", true))
+        return ITEM_FOOD;
+    if (!strcmp(input, "bandage", true) || !strcmp(input, "Р±РёРЅС‚", true))
+        return ITEM_BANDAGE;
+    if (!strcmp(input, "medkit", true) || !strcmp(input, "Р°РїС‚РµС‡РєР°", true))
+        return ITEM_MEDKIT;
+    if (!strcmp(input, "ammo", true) || !strcmp(input, "РїР°С‚СЂРѕРЅС‹", true))
+        return ITEM_AMMO;
+    if (!strcmp(input, "toolkit", true) || !strcmp(input, "РёРЅСЃС‚СЂСѓРјРµРЅС‚С‹", true) || !strcmp(input, "СЂРµРјРєРѕРјРїР»РµРєС‚", true))
+        return ITEM_TOOLKIT;
+    if (!strcmp(input, "flare", true) || !strcmp(input, "С„Р°РєРµР»", true) || !strcmp(input, "С€Р°С€РєР°", true))
+        return ITEM_FLARE;
+    return ITEM_NONE;
+}
+
+stock RandomLootItem()
+{
+    new roll = random(100);
+    if (roll < 25) return ITEM_WATER;
+    if (roll < 50) return ITEM_FOOD;
+    if (roll < 65) return ITEM_BANDAGE;
+    if (roll < 78) return ITEM_AMMO;
+    if (roll < 88) return ITEM_TOOLKIT;
+    if (roll < 95) return ITEM_MEDKIT;
+    return ITEM_FLARE;
+}
+
+stock CreateLootAtIndex(index)
+{
+    if (index < 0 || index >= LOOT_POINT_COUNT)
+        return 0;
+
+    new item = RandomLootItem();
+    gLootPoints[index][lootItem] = item;
+    gLootPoints[index][lootActive] = true;
+
+    new model = gItemModels[item];
+    if (!model) model = 1279;
+
+    gLootPoints[index][lootPickup] = CreatePickup(model, 2, gLootPoints[index][lootX], gLootPoints[index][lootY], gLootPoints[index][lootZ], -1);
+    return 1;
+}
+
+stock DestroyLootAtIndex(index)
+{
+    if (index < 0 || index >= LOOT_POINT_COUNT)
+        return 0;
+
+    if (gLootPoints[index][lootActive] && gLootPoints[index][lootPickup] != 0)
+        DestroyPickup(gLootPoints[index][lootPickup]);
+
+    gLootPoints[index][lootPickup] = 0;
+    gLootPoints[index][lootActive] = false;
+    gLootPoints[index][lootItem] = ITEM_NONE;
+    return 1;
+}
+
+stock SetupLootPoints()
+{
+    for (new i = 0; i < LOOT_POINT_COUNT; i++)
+    {
+        gLootPoints[i][lootX] = gLootPointCoords[i][0];
+        gLootPoints[i][lootY] = gLootPointCoords[i][1];
+        gLootPoints[i][lootZ] = gLootPointCoords[i][2];
+        gLootPoints[i][lootPickup] = 0;
+        gLootPoints[i][lootItem] = ITEM_NONE;
+        gLootPoints[i][lootActive] = false;
+        CreateLootAtIndex(i);
+    }
+    return 1;
+}
+
+stock CleanupLootPoints()
+{
+    for (new i = 0; i < LOOT_POINT_COUNT; i++)
+        DestroyLootAtIndex(i);
+    return 1;
+}
+
+stock SetupZombies()
+{
+    for (new i = 0; i < MAX_ZOMBIES; i++)
+    {
+        gZombieActors[i] = CreateActor(162, gZombieSpawns[i][0], gZombieSpawns[i][1], gZombieSpawns[i][2], float(random(360)));
+    }
+    return 1;
+}
+
+stock CleanupZombies()
+{
+    for (new i = 0; i < MAX_ZOMBIES; i++)
+    {
+        if (gZombieActors[i] != INVALID_ACTOR_ID)
+        {
+            DestroyActor(gZombieActors[i]);
+            gZombieActors[i] = INVALID_ACTOR_ID;
+        }
+    }
+    return 1;
+}
+
+stock GiveStarterNotification(playerid)
+{
+    SendClientMessage(playerid, COLOR_INFO, "Р”РѕР±СЂРѕ РїРѕР¶Р°Р»РѕРІР°С‚СЊ РІ {FFFFFF}DayZ{A0D0FF}. РСЃРїРѕР»СЊР·СѓР№ /help РґР»СЏ СЃРїРёСЃРєР° РєРѕРјР°РЅРґ.");
+    SendClientMessage(playerid, COLOR_INFO, "Р’С‹Р¶РёРІРё РєР°Рє РјРѕР¶РЅРѕ РґРѕР»СЊС€Рµ: СЃР»РµРґРё Р·Р° РіРѕР»РѕРґРѕРј, Р¶Р°Р¶РґРѕР№ Рё РёР·Р±РµРіР°Р№ Р·Р°СЂР°Р¶РµРЅРёСЏ.");
+    return 1;
+}
+
+stock ShowPlayerStatus(playerid)
+{
+    new Float:health;
+    GetPlayerHealth(playerid, health);
+
+    new line[144];
+    format(line, sizeof(line), "{C8FFC8}Р—РґРѕСЂРѕРІСЊРµ: %.0f | Р“РѕР»РѕРґ: %.0f%% | Р–Р°Р¶РґР°: %.0f%%", health, gPlayerHunger[playerid], gPlayerThirst[playerid]);
+    SendClientMessage(playerid, COLOR_INFO, line);
+
+    format(line, sizeof(line), "{FFCD82}РљСЂРѕРІРѕС‚РµС‡РµРЅРёРµ: %s | РРЅС„РµРєС†РёСЏ: %s", gPlayerBleeding[playerid] ? "РґР°" : "РЅРµС‚", gPlayerInfected[playerid] ? "РґР°" : "РЅРµС‚");
+    SendClientMessage(playerid, COLOR_INFO, line);
+
+    new inventory[196];
+    BuildInventoryString(playerid, inventory, sizeof(inventory));
+    format(line, sizeof(line), "{E3E3E3}РРЅРІРµРЅС‚Р°СЂСЊ: %s", inventory);
+    SendClientMessage(playerid, COLOR_INFO, line);
+    return 1;
+}
+
+stock BuildInventoryString(playerid, dest[], len)
+{
+    dest[0] = '\0';
+    new bool:first = true;
+
+    for (new item = 1; item < ITEM_COUNT; item++)
+    {
+        if (gPlayerInventory[playerid][item] > 0)
+        {
+            new itemName[32];
+            GetItemName(E_ITEM_TYPE:item, itemName, sizeof(itemName));
+
+            if (first)
+            {
+                format(dest, len, "%s x%d", itemName, gPlayerInventory[playerid][item]);
+                first = false;
+            }
+            else
+            {
+                format(dest, len, "%s, %s x%d", dest, itemName, gPlayerInventory[playerid][item]);
+            }
+        }
+    }
+
+    if (first)
+        format(dest, len, "РЅРёС‡РµРіРѕ");
+
+    return 1;
+}
+
+stock bool:TakeInventoryItem(playerid, E_ITEM_TYPE:item)
+{
+    if (item <= ITEM_NONE || item >= ITEM_COUNT)
+        return false;
+
+    if (gPlayerInventory[playerid][item] <= 0)
+        return false;
+
+    gPlayerInventory[playerid][item]--;
+    return true;
+}
+
+stock GiveInventoryItem(playerid, E_ITEM_TYPE:item, amount)
+{
+    if (item <= ITEM_NONE || item >= ITEM_COUNT)
+        return 0;
+
+    gPlayerInventory[playerid][item] += amount;
+    return 1;
+}
+
+stock HandlePlayerDeath(playerid)
+{
+    for (new item = 0; item < ITEM_COUNT; item++)
+        gPlayerInventory[playerid][item] = 0;
+
+    gPlayerBleeding[playerid] = false;
+    gPlayerBleedWarned[playerid] = false;
+    gPlayerInfected[playerid] = false;
+    gPlayerHungryWarned[playerid] = false;
+    gPlayerThirstWarned[playerid] = false;
+    gPlayerInfectionWarned[playerid] = false;
+    return 1;
+}
+
+// -------------------- РћСЃРЅРѕРІРЅС‹Рµ РєРѕР»Р±СЌРєРё --------------------
 main()
 {
     print("\n----------------------------------");
-    print(" GunGame + /gpt (Direct OpenAI HTTPS) — CRASH-FIX");
-    print(" Commands: /gpt <text>    |    RCON: gpt <text>");
+    print("    DayZ Survival Gamemode");
     print("----------------------------------\n");
 }
 
 public OnGameModeInit()
 {
-    SetGameModeText("Gun Game + GPT");
-    AddPlayerClass(0, -1291.6622, 2513.7566, 87.0500, 355.3697, WEAPON_FIST, 0, WEAPON_FIST, 0, WEAPON_FIST, 0);
+    SetGameModeText("DayZ Survival");
+    UsePlayerPedAnims();
+    ShowPlayerMarkers(PLAYER_MARKERS_MODE_OFF);
+    DisableInteriorEnterExits();
+    EnableStuntBonusForAll(false);
+    AllowInteriorWeapons(true);
+    SetNameTagDrawDistance(25.0);
+    SetWorldTime(10);
+    SetWeather(9);
 
-    // Только базовый адрес — БЕЗ заголовков
-    gOpenAI = RequestsClient("https://api.openai.com/v1/");
+    for (new i = 0; i < sizeof(gSurvivorSpawns); i++)
+    {
+        AddPlayerClass(230, gSurvivorSpawns[i][0], gSurvivorSpawns[i][1], gSurvivorSpawns[i][2], gSurvivorSpawns[i][3], WEAPON_FIST, 0, WEAPON_FIST, 0, WEAPON_FIST, 0);
+    }
 
-    print("Готово. /gpt <запрос> — ответ в чат (OpenAI Responses API).");
+    SetupLootPoints();
+    SetupZombies();
+
+    gSurvivalTimer = SetTimer("SurvivalTick", SURVIVAL_TICK_MS, true);
+    gZombieTimer = SetTimer("ZombieTick", ZOMBIE_TICK_MS, true);
+
+    print("DayZ Survival gamemode СѓСЃРїРµС€РЅРѕ Р·Р°РіСЂСѓР¶РµРЅ.");
+    return 1;
+}
+
+public OnGameModeExit()
+{
+    if (gSurvivalTimer != -1)
+    {
+        KillTimer(gSurvivalTimer);
+        gSurvivalTimer = -1;
+    }
+
+    if (gZombieTimer != -1)
+    {
+        KillTimer(gZombieTimer);
+        gZombieTimer = -1;
+    }
+
+    CleanupLootPoints();
+    CleanupZombies();
     return 1;
 }
 
 public OnPlayerConnect(playerid)
 {
-    SendClientMessage(playerid, COLOR_INFO, "Команда: /gpt <запрос> — короткий ответ от ChatGPT.");
+    ResetPlayerSurvivalData(playerid);
+    GiveStarterNotification(playerid);
+    SendClientMessage(playerid, COLOR_INFO, "РСЃРїРѕР»СЊР·СѓР№ /status РґР»СЏ РїСЂРѕРІРµСЂРєРё СЃРѕСЃС‚РѕСЏРЅРёСЏ, /use [РїСЂРµРґРјРµС‚] РґР»СЏ РёСЃРїРѕР»СЊР·РѕРІР°РЅРёСЏ.");
     return 1;
 }
 
-// ---- Парсинг команды из чата ----
+public OnPlayerDisconnect(playerid, reason)
+{
+    HandlePlayerDeath(playerid);
+    return 1;
+}
+
+public OnPlayerRequestClass(playerid, classid)
+{
+    SetPlayerPos(playerid, gSurvivorSpawns[classid % sizeof(gSurvivorSpawns)][0], gSurvivorSpawns[classid % sizeof(gSurvivorSpawns)][1], gSurvivorSpawns[classid % sizeof(gSurvivorSpawns)][2] + 3.0);
+    SetPlayerCameraPos(playerid, gSurvivorSpawns[classid % sizeof(gSurvivorSpawns)][0] + 3.0, gSurvivorSpawns[classid % sizeof(gSurvivorSpawns)][1], gSurvivorSpawns[classid % sizeof(gSurvivorSpawns)][2] + 3.0);
+    SetPlayerCameraLookAt(playerid, gSurvivorSpawns[classid % sizeof(gSurvivorSpawns)][0], gSurvivorSpawns[classid % sizeof(gSurvivorSpawns)][1], gSurvivorSpawns[classid % sizeof(gSurvivorSpawns)][2]);
+    GameTextForPlayer(playerid, "~w~DayZ Survival", 4000, 3);
+    return 1;
+}
+
+public OnPlayerSpawn(playerid)
+{
+    ResetPlayerSurvivalData(playerid);
+
+    new spawnIndex = random(sizeof(gSurvivorSpawns));
+    SetPlayerPos(playerid, gSurvivorSpawns[spawnIndex][0], gSurvivorSpawns[spawnIndex][1], gSurvivorSpawns[spawnIndex][2]);
+    SetPlayerFacingAngle(playerid, gSurvivorSpawns[spawnIndex][3]);
+    SetPlayerHealth(playerid, 100.0);
+    SetPlayerArmor(playerid, 0.0);
+    ResetPlayerWeapons(playerid);
+
+    GiveStarterNotification(playerid);
+    return 1;
+}
+
+public OnPlayerDeath(playerid, killerid, reason)
+{
+    HandlePlayerDeath(playerid);
+    SendClientMessage(playerid, COLOR_DANGER, "Р’С‹ РїРѕРіРёР±Р»Рё Рё РїРѕС‚РµСЂСЏР»Рё РІСЃРµ РїСЂРёРїР°СЃС‹. РџРѕРїСЂРѕР±СѓР№С‚Рµ РµС‰С‘ СЂР°Р·!");
+    return 1;
+}
+
 public OnPlayerCommandText(playerid, cmdtext[])
 {
-    // Сравниваем первые 4 символа "/gpt" без учета регистра
-    if(!strcmp(cmdtext, "/gpt", true, 4))
+    if (!strcmp(cmdtext, "/status", true))
     {
-        new len = strlen(cmdtext);
-        if (cmdtext[4] == '\0' || len <= 5 || cmdtext[4] != ' ')
+        ShowPlayerStatus(playerid);
+        return 1;
+    }
+
+    if (!strcmp(cmdtext, "/help", true))
+    {
+        SendClientMessage(playerid, COLOR_INFO, "Р”РѕСЃС‚СѓРїРЅС‹Рµ РєРѕРјР°РЅРґС‹: /status, /use [РїСЂРµРґРјРµС‚], /craft flare, /craft ammo");
+        SendClientMessage(playerid, COLOR_INFO, "РџСЂРёРјРµСЂС‹: /use РІРѕРґР°, /use bandage, /craft flare");
+        return 1;
+    }
+
+    if (!strcmp(cmdtext, "/inventory", true) || !strcmp(cmdtext, "/inv", true))
+    {
+        new inventory[196];
+        BuildInventoryString(playerid, inventory, sizeof(inventory));
+        new message[220];
+        format(message, sizeof(message), "Р’Р°С€ РёРЅРІРµРЅС‚Р°СЂСЊ: %s", inventory);
+        SendClientMessage(playerid, COLOR_INFO, message);
+        return 1;
+    }
+
+    if (!strcmp(cmdtext, "/use", true, 4))
+    {
+        if (cmdtext[4] == '\0')
         {
-            SendClientMessage(playerid, COLOR_INFO, "Использование: /gpt <запрос>");
+            SendClientMessage(playerid, COLOR_INFO, "РСЃРїРѕР»СЊР·РѕРІР°РЅРёРµ: /use [РїСЂРµРґРјРµС‚]");
             return 1;
         }
 
-        new prompt[256];
-        strmid(prompt, cmdtext, 5, len, sizeof(prompt)); // текст после "/gpt "
-
-        // Тело запроса для OpenAI Responses API
-        new Node:body = JsonObject(
-            "model",             JsonString(OPENAI_MODEL),
-            "input",             JsonString(prompt),
-            "instructions",      JsonString("Отвечай одной строкой, кратко и по-русски."),
-            "max_output_tokens", JsonInt(120)
-        );
-
-        // ВАЖНО: заголовки передаем тут, при самом запросе
-        RequestJSON(
-            gOpenAI,
-            "responses",
-            HTTP_METHOD_POST,
-            "OnGptResponse",
-            body,
-            RequestHeaders(
-                "Authorization", "Bearer " OPENAI_API_KEY,
-                "Content-Type",  "application/json"
-            )
-        );
-
-        SendClientMessage(playerid, COLOR_INFO, "Запрашиваем ChatGPT...");
-        return 1;
-    }
-    return 0;
-}
-
-// ---- RCON вариант ----
-public OnRconCommand(cmd[])
-{
-    if(cmd[0] == '/') strdel(cmd, 0, 1);
-
-    if(!strcmp(cmd, "gpt", true, 3))
-    {
-        new len = strlen(cmd);
-        if (cmd[3] == '\0' || len <= 4 || cmd[3] != ' ')
+        if (cmdtext[4] != ' ')
         {
-            print("[RCON] Использование: gpt <запрос>");
+            SendClientMessage(playerid, COLOR_INFO, "РСЃРїРѕР»СЊР·РѕРІР°РЅРёРµ: /use [РїСЂРµРґРјРµС‚]");
             return 1;
         }
 
-        new prompt[256];
-        strmid(prompt, cmd, 4, len, sizeof(prompt)); // после "gpt "
+        new param[32];
+        strmid(param, cmdtext, 5, strlen(cmdtext), sizeof(param));
 
-        new Node:body = JsonObject(
-            "model",             JsonString(OPENAI_MODEL),
-            "input",             JsonString(prompt),
-            "instructions",      JsonString("Отвечай одной строкой, кратко и по-русски."),
-            "max_output_tokens", JsonInt(120)
-        );
+        new E_ITEM_TYPE:item = GetItemTypeFromString(param);
+        if (item == ITEM_NONE)
+        {
+            SendClientMessage(playerid, COLOR_INFO, "РќРµРёР·РІРµСЃС‚РЅС‹Р№ РїСЂРµРґРјРµС‚.");
+            return 1;
+        }
 
-        RequestJSON(
-            gOpenAI,
-            "responses",
-            HTTP_METHOD_POST,
-            "OnGptResponse",
-            body,
-            RequestHeaders(
-                "Authorization", "Bearer " OPENAI_API_KEY,
-                "Content-Type",  "application/json"
-            )
-        );
+        if (!TakeInventoryItem(playerid, item))
+        {
+            SendClientMessage(playerid, COLOR_WARNING, "РЈ РІР°СЃ РЅРµС‚ С‚Р°РєРѕРіРѕ РїСЂРµРґРјРµС‚Р°.");
+            return 1;
+        }
 
-        print("[RCON] Запрос отправлен в OpenAI...");
+        ApplyItemUsage(playerid, item);
         return 1;
     }
+
+    if (!strcmp(cmdtext, "/craft", true, 6))
+    {
+        if (cmdtext[6] == '\0' || cmdtext[6] != ' ')
+        {
+            SendClientMessage(playerid, COLOR_INFO, "РСЃРїРѕР»СЊР·РѕРІР°РЅРёРµ: /craft [РЅР°Р·РІР°РЅРёРµ]");
+            return 1;
+        }
+
+        new param[24];
+        strmid(param, cmdtext, 7, strlen(cmdtext), sizeof(param));
+
+        if (!strcmp(param, "flare", true) || !strcmp(param, "С„Р°РєРµР»", true))
+        {
+            if (gPlayerInventory[playerid][ITEM_TOOLKIT] >= 1 && gPlayerInventory[playerid][ITEM_AMMO] >= 1)
+            {
+                gPlayerInventory[playerid][ITEM_TOOLKIT]--;
+                gPlayerInventory[playerid][ITEM_AMMO]--;
+                gPlayerInventory[playerid][ITEM_FLARE]++;
+                SendClientMessage(playerid, COLOR_ACTION, "Р’С‹ СЃРѕР±СЂР°Р»Рё СЃРёРіРЅР°Р»СЊРЅСѓСЋ С€Р°С€РєСѓ РёР· РїР°С‚СЂРѕРЅРѕРІ Рё РёРЅСЃС‚СЂСѓРјРµРЅС‚РѕРІ.");
+            }
+            else
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "РќСѓР¶РЅРѕ: 1 РЅР°Р±РѕСЂ РёРЅСЃС‚СЂСѓРјРµРЅС‚РѕРІ Рё 1 РїР°С‡РєР° РїР°С‚СЂРѕРЅРѕРІ.");
+            }
+            return 1;
+        }
+
+        if (!strcmp(param, "ammo", true) || !strcmp(param, "РїР°С‚СЂРѕРЅС‹", true))
+        {
+            if (gPlayerInventory[playerid][ITEM_TOOLKIT] >= 1 && gPlayerInventory[playerid][ITEM_FOOD] >= 1)
+            {
+                gPlayerInventory[playerid][ITEM_TOOLKIT]--;
+                gPlayerInventory[playerid][ITEM_FOOD]--;
+                gPlayerInventory[playerid][ITEM_AMMO] += 2;
+                SendClientMessage(playerid, COLOR_ACTION, "Р’С‹ СЃРѕР±СЂР°Р»Рё СЃР°РјРѕРґРµР»СЊРЅС‹Рµ РїР°С‚СЂРѕРЅС‹, РїРѕС‚СЂР°С‚РёРІ РёРЅСЃС‚СЂСѓРјРµРЅС‚С‹ Рё РєРѕРЅСЃРµСЂРІС‹.");
+            }
+            else
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "РќСѓР¶РЅРѕ: 1 РЅР°Р±РѕСЂ РёРЅСЃС‚СЂСѓРјРµРЅС‚РѕРІ Рё 1 РєРѕРЅСЃРµСЂРІР°.");
+            }
+            return 1;
+        }
+
+        SendClientMessage(playerid, COLOR_INFO, "РќРµРёР·РІРµСЃС‚РЅС‹Р№ СЂРµС†РµРїС‚. Р”РѕСЃС‚СѓРїРЅС‹Рµ: flare, ammo");
+        return 1;
+    }
+
     return 0;
 }
 
-// ---- Успешный ответ OpenAI ----
-public OnGptResponse(Request:id, E_HTTP_STATUS:status, Node:node)
+public OnPlayerPickUpPickup(playerid, pickupid)
 {
-    if(status != HTTP_STATUS_OK)
+    for (new i = 0; i < LOOT_POINT_COUNT; i++)
     {
-        printf("? OpenAI HTTP status: %d", _:status);
-        return 1;
-    }
+        if (!gLootPoints[i][lootActive])
+            continue;
 
-    new out[192];
-    if (JsonGetString(node, "output_text", out, sizeof(out)) && out[0])
-    {
-        for(new i = 0; i < MAX_PLAYERS; i++)
-            if(IsPlayerConnected(i)) SendClientMessage(i, COLOR_INFO, out);
-        printf("?? GPT: %s", out);
-        JsonCleanup(node);
-        return 1;
-    }
+        if (gLootPoints[i][lootPickup] == pickupid)
+        {
+            new item = gLootPoints[i][lootItem];
+            if (item <= ITEM_NONE || item >= ITEM_COUNT)
+                return 1;
 
-    // Фолбэк: вывести сырой JSON, если не нашли output_text
-    new raw[256];
-    JsonStringify(node, raw, sizeof(raw));
-    printf("?? Не удалось получить output_text. Ответ: %s", raw);
-    JsonCleanup(node);
+            GiveInventoryItem(playerid, E_ITEM_TYPE:item, 1);
+
+            new itemName[32];
+            GetItemName(E_ITEM_TYPE:item, itemName, sizeof(itemName));
+
+            new message[96];
+            format(message, sizeof(message), "Р’С‹ РЅР°С€Р»Рё %s", itemName);
+            SendClientMessage(playerid, COLOR_ACTION, message);
+
+            DestroyLootAtIndex(i);
+            SetTimerEx("RespawnLoot", LOOT_RESPAWN_MS, false, "d", i);
+            return 1;
+        }
+    }
     return 1;
 }
+
+public OnPlayerTakeDamage(playerid, issuerid, Float:amount, weaponid, bodypart)
+{
+    if (amount >= 15.0 && !gPlayerBleeding[playerid] && random(100) < 40)
+    {
+        gPlayerBleeding[playerid] = true;
+        gPlayerBleedWarned[playerid] = true;
+        SendClientMessage(playerid, COLOR_DANGER, "Р’С‹ РїРѕР»СѓС‡РёР»Рё СЃРµСЂСЊС‘Р·РЅСѓСЋ СЂР°РЅСѓ Рё РЅР°С‡Р°Р»Рё РёСЃС‚РµРєР°С‚СЊ РєСЂРѕРІСЊСЋ. РСЃРїРѕР»СЊР·СѓР№С‚Рµ Р±РёРЅС‚!");
+    }
+    return 1;
+}
+
+// -------------------- РћР±СЂР°Р±РѕС‚РєР° РїСЂРµРґРјРµС‚РѕРІ --------------------
+stock ApplyItemUsage(playerid, E_ITEM_TYPE:item)
+{
+    switch (item)
+    {
+        case ITEM_WATER:
+        {
+            gPlayerThirst[playerid] = ClampFloat(gPlayerThirst[playerid] + 45.0, 0.0, 100.0);
+            SendClientMessage(playerid, COLOR_ACTION, "Р’С‹ СѓС‚РѕР»РёР»Рё Р¶Р°Р¶РґСѓ.");
+        }
+        case ITEM_FOOD:
+        {
+            gPlayerHunger[playerid] = ClampFloat(gPlayerHunger[playerid] + 35.0, 0.0, 100.0);
+            SendClientMessage(playerid, COLOR_ACTION, "Р’С‹ РїРµСЂРµРєСѓСЃРёР»Рё РєРѕРЅСЃРµСЂРІР°РјРё.");
+        }
+        case ITEM_BANDAGE:
+        {
+            if (gPlayerBleeding[playerid])
+            {
+                gPlayerBleeding[playerid] = false;
+                gPlayerBleedWarned[playerid] = false;
+                SendClientMessage(playerid, COLOR_ACTION, "Р’С‹ РїРµСЂРµРІСЏР·Р°Р»Рё СЂР°РЅСѓ Рё РѕСЃС‚Р°РЅРѕРІРёР»Рё РєСЂРѕРІРѕС‚РµС‡РµРЅРёРµ.");
+            }
+            else
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "РЈ РІР°СЃ РЅРµС‚ РєСЂРѕРІРѕС‚РµС‡РµРЅРёСЏ. Р‘РёРЅС‚ СЃРѕС…СЂР°РЅС‘РЅ.");
+                gPlayerInventory[playerid][ITEM_BANDAGE]++;
+            }
+        }
+        case ITEM_MEDKIT:
+        {
+            new Float:health;
+            GetPlayerHealth(playerid, health);
+            health = ClampFloat(health + 35.0, 0.0, 100.0);
+            SetPlayerHealth(playerid, health);
+
+            gPlayerBleeding[playerid] = false;
+            gPlayerBleedWarned[playerid] = false;
+            gPlayerInfected[playerid] = false;
+            gPlayerInfectionWarned[playerid] = false;
+            SendClientMessage(playerid, COLOR_ACTION, "Р’С‹ РёСЃРїРѕР»СЊР·РѕРІР°Р»Рё Р°РїС‚РµС‡РєСѓ Рё РїРѕРїСЂР°РІРёР»Рё Р·РґРѕСЂРѕРІСЊРµ.");
+        }
+        case ITEM_AMMO:
+        {
+            new weapon = GetPlayerWeapon(playerid);
+            if (weapon == 0 || weapon == WEAPON_FIST)
+            {
+                GivePlayerWeapon(playerid, WEAPON_COLT45, 30);
+                SendClientMessage(playerid, COLOR_ACTION, "Р’С‹ РЅР°С€Р»Рё СЃС‚Р°СЂС‹Р№ РїРёСЃС‚РѕР»РµС‚ РІРјРµСЃС‚Рµ СЃ РїР°С‚СЂРѕРЅР°РјРё.");
+            }
+            else
+            {
+                GivePlayerWeapon(playerid, weapon, 30);
+                SendClientMessage(playerid, COLOR_ACTION, "Р’С‹ РїРѕРїРѕР»РЅРёР»Рё Р±РѕРµР·Р°РїР°СЃ.");
+            }
+        }
+        case ITEM_TOOLKIT:
+        {
+            if (IsPlayerInAnyVehicle(playerid))
+            {
+                new vehicleid = GetPlayerVehicleID(playerid);
+                RepairVehicle(vehicleid);
+                SendClientMessage(playerid, COLOR_ACTION, "Р’С‹ РѕС‚СЂРµРјРѕРЅС‚РёСЂРѕРІР°Р»Рё С‚СЂР°РЅСЃРїРѕСЂС‚.");
+            }
+            else
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "Р’С‹ РЅРµ РІ С‚СЂР°РЅСЃРїРѕСЂС‚Рµ. РќР°Р±РѕСЂ СЃРѕС…СЂР°РЅС‘РЅ.");
+                gPlayerInventory[playerid][ITEM_TOOLKIT]++;
+            }
+        }
+        case ITEM_FLARE:
+        {
+            new Float:x, Float:y, Float:z;
+            GetPlayerPos(playerid, x, y, z);
+            CreateExplosion(x, y, z, 3, 2.0);
+            SendClientMessage(playerid, COLOR_ACTION, "Р’С‹ РїРѕРґРѕР¶РіР»Рё СЃРёРіРЅР°Р»СЊРЅСѓСЋ С€Р°С€РєСѓ, Р·РѕРјР±Рё СѓСЃР»С‹С€Р°Р»Рё С€СѓРј!");
+        }
+    }
+    return 1;
+}
+
+// -------------------- РўР°Р№РјРµСЂС‹ --------------------
+public SurvivalTick()
+{
+    for (new playerid = 0; playerid < MAX_PLAYERS; playerid++)
+    {
+        if (!IsPlayerConnected(playerid))
+            continue;
+
+        new state = GetPlayerState(playerid);
+        if (state != PLAYER_STATE_ONFOOT && state != PLAYER_STATE_DRIVER && state != PLAYER_STATE_PASSENGER)
+            continue;
+
+        gPlayerHunger[playerid] = ClampFloat(gPlayerHunger[playerid] - 2.0, 0.0, 100.0);
+        gPlayerThirst[playerid] = ClampFloat(gPlayerThirst[playerid] - 3.0, 0.0, 100.0);
+
+        new Float:health;
+        GetPlayerHealth(playerid, health);
+
+        if (gPlayerHunger[playerid] <= 0.0)
+        {
+            health = ClampFloat(health - 4.0, 0.0, 100.0);
+            if (!gPlayerHungryWarned[playerid])
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "Р’С‹ СѓРјРёСЂР°РµС‚Рµ РѕС‚ РіРѕР»РѕРґР°! РќР°Р№РґРёС‚Рµ РµРґСѓ РЅРµРјРµРґР»РµРЅРЅРѕ.");
+                gPlayerHungryWarned[playerid] = true;
+            }
+        }
+        else if (gPlayerHunger[playerid] < 30.0 && !gPlayerHungryWarned[playerid])
+        {
+            SendClientMessage(playerid, COLOR_WARNING, "Р’С‹ РїСЂРѕРіРѕР»РѕРґР°Р»РёСЃСЊ. РџРѕРёС‰РёС‚Рµ РєРѕРЅСЃРµСЂРІС‹ РёР»Рё РїСЂРёРіРѕС‚РѕРІСЊС‚Рµ РµРґСѓ.");
+            gPlayerHungryWarned[playerid] = true;
+        }
+        else if (gPlayerHunger[playerid] > 45.0)
+        {
+            gPlayerHungryWarned[playerid] = false;
+        }
+
+        if (gPlayerThirst[playerid] <= 0.0)
+        {
+            health = ClampFloat(health - 6.0, 0.0, 100.0);
+            if (!gPlayerThirstWarned[playerid])
+            {
+                SendClientMessage(playerid, COLOR_DANGER, "Р’С‹ РѕР±РµР·РІРѕР¶РµРЅС‹ Рё С‚РµСЂСЏРµС‚Рµ Р·РґРѕСЂРѕРІСЊРµ!");
+                gPlayerThirstWarned[playerid] = true;
+            }
+        }
+        else if (gPlayerThirst[playerid] < 30.0 && !gPlayerThirstWarned[playerid])
+        {
+            SendClientMessage(playerid, COLOR_WARNING, "Р’С‹ РёСЃРїС‹С‚С‹РІР°РµС‚Рµ Р¶Р°Р¶РґСѓ. РќР°Р№РґРёС‚Рµ РІРѕРґСѓ.");
+            gPlayerThirstWarned[playerid] = true;
+        }
+        else if (gPlayerThirst[playerid] > 45.0)
+        {
+            gPlayerThirstWarned[playerid] = false;
+        }
+
+        if (gPlayerBleeding[playerid])
+        {
+            health = ClampFloat(health - 5.0, 0.0, 100.0);
+            if (!gPlayerBleedWarned[playerid])
+            {
+                SendClientMessage(playerid, COLOR_DANGER, "Р’С‹ РёСЃС‚РµРєР°РµС‚Рµ РєСЂРѕРІСЊСЋ! РСЃРїРѕР»СЊР·СѓР№С‚Рµ Р±РёРЅС‚.");
+                gPlayerBleedWarned[playerid] = true;
+            }
+        }
+        else
+        {
+            gPlayerBleedWarned[playerid] = false;
+        }
+
+        if (gPlayerInfected[playerid])
+        {
+            health = ClampFloat(health - 3.0, 0.0, 100.0);
+            if (!gPlayerInfectionWarned[playerid])
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "Р’С‹ Р·Р°СЂР°Р¶РµРЅС‹. РќР°Р№РґРёС‚Рµ Р°РїС‚РµС‡РєСѓ!");
+                gPlayerInfectionWarned[playerid] = true;
+            }
+        }
+        else
+        {
+            gPlayerInfectionWarned[playerid] = false;
+        }
+
+        SetPlayerHealth(playerid, health);
+
+        if (health <= 0.0)
+        {
+            SetPlayerHealth(playerid, 0.0);
+        }
+    }
+    return 1;
+}
+
+public ZombieTick()
+{
+    for (new i = 0; i < MAX_ZOMBIES; i++)
+    {
+        if (gZombieActors[i] == INVALID_ACTOR_ID)
+            continue;
+
+        new Float:zx, Float:zy, Float:zz;
+        GetActorPos(gZombieActors[i], zx, zy, zz);
+
+        if (random(100) < 15)
+        {
+            new Float:offsetX = float(random(600) - 300) / 100.0;
+            new Float:offsetY = float(random(600) - 300) / 100.0;
+            SetActorPos(gZombieActors[i], zx + offsetX, zy + offsetY, zz);
+        }
+
+        for (new playerid = 0; playerid < MAX_PLAYERS; playerid++)
+        {
+            if (!IsPlayerConnected(playerid))
+                continue;
+
+            if (GetPlayerState(playerid) == PLAYER_STATE_WASTED)
+                continue;
+
+            new Float:px, Float:py, Float:pz;
+            GetPlayerPos(playerid, px, py, pz);
+
+            new Float:distance = floatsqroot(floatpower(px - zx, 2.0) + floatpower(py - zy, 2.0) + floatpower(pz - zz, 2.0));
+
+            if (distance < 1.8)
+            {
+                new Float:health;
+                GetPlayerHealth(playerid, health);
+                health = ClampFloat(health - 7.0, 0.0, 100.0);
+                SetPlayerHealth(playerid, health);
+
+                if (random(100) < 35 && !gPlayerBleeding[playerid])
+                {
+                    gPlayerBleeding[playerid] = true;
+                    gPlayerBleedWarned[playerid] = true;
+                    SendClientMessage(playerid, COLOR_ZOMBIE, "Р—РѕРјР±Рё СЂР°Р·РѕСЂРІР°Р» РІР°Рј РєРѕР¶Сѓ! Р’С‹ РёСЃС‚РµРєР°РµС‚Рµ РєСЂРѕРІСЊСЋ.");
+                }
+
+                if (random(100) < 20)
+                {
+                    gPlayerInfected[playerid] = true;
+                    gPlayerInfectionWarned[playerid] = true;
+                    SendClientMessage(playerid, COLOR_ZOMBIE, "Р’С‹ Р·Р°СЂР°Р¶РµРЅС‹ РІРёСЂСѓСЃРѕРј. РЎСЂРѕС‡РЅРѕ РЅР°Р№РґРёС‚Рµ Р°РїС‚РµС‡РєСѓ!");
+                }
+
+                GameTextForPlayer(playerid, "~r~Zombie hit!", 1500, 3);
+            }
+            else if (distance < 8.0 && random(100) < 30)
+            {
+                new Float:look = atan2(px - zx, py - zy);
+                SetActorFacingAngle(gZombieActors[i], look);
+            }
+        }
+    }
+    return 1;
+}
+
+public RespawnLoot(index)
+{
+    CreateLootAtIndex(index);
+    return 1;
+}
+
