@@ -20,7 +20,20 @@
 #define MAX_ZOMBIES         (16)
 #define LOOT_POINT_COUNT    (20)
 
-#define INVALID_ACTOR_ID    (-1)
+#define TEMPERATURE_NORMAL             (36.5)
+#define TEMPERATURE_MINIMUM            (30.0)
+#define TEMPERATURE_MAXIMUM            (41.5)
+#define TEMPERATURE_WARN_COLD          (34.5)
+#define TEMPERATURE_WARN_HOT           (39.0)
+#define TEMPERATURE_DAMAGE_COLD        (33.0)
+#define TEMPERATURE_DAMAGE_HOT         (40.0)
+#define TEMPERATURE_DAMAGE_AMOUNT      (4.5)
+#define WARM_BUFF_DURATION_MS          (120000)
+
+#define AIRDROP_INTERVAL_MS            (420000)
+#define AIRDROP_MODEL                  (1279)
+#define AIRDROP_ITEM_ROLLS             (4)
+
 
 enum E_ITEM_TYPE
 {
@@ -119,13 +132,25 @@ static const Float:gLootPointCoords[LOOT_POINT_COUNT][3] =
     {-128.4512, 2726.7747, 62.6953}
 };
 
+static const Float:gAirdropLocations[][3] =
+{
+    {-2525.4316, 234.1845, 34.6172},
+    {-215.7431, 2735.4478, 63.0078},
+    {1278.9028, 2556.3320, 10.8203},
+    {2035.1146, -1912.5120, 13.5469},
+    {2475.3826, -1522.1914, 24.4531},
+    {2765.4915, -2444.0095, 13.6484},
+    {1019.6325, -326.2751, 74.0938},
+    {-1665.2146, 428.5129, 6.9609}
+};
+
 enum E_LOOT_DATA
 {
     Float:lootX,
     Float:lootY,
     Float:lootZ,
     lootPickup,
-    lootItem,
+    E_ITEM_TYPE:lootItem,
     bool:lootActive
 };
 
@@ -144,11 +169,25 @@ new bool:gPlayerHungryWarned[MAX_PLAYERS];
 new bool:gPlayerThirstWarned[MAX_PLAYERS];
 new bool:gPlayerInfectionWarned[MAX_PLAYERS];
 new gPlayerInventory[MAX_PLAYERS][ITEM_COUNT];
+new Float:gPlayerTemperature[MAX_PLAYERS];
+new bool:gPlayerColdWarned[MAX_PLAYERS];
+new bool:gPlayerHeatWarned[MAX_PLAYERS];
+new bool:gPlayerFreezing[MAX_PLAYERS];
+new bool:gPlayerOverheating[MAX_PLAYERS];
+new gPlayerWarmUntil[MAX_PLAYERS];
+new bool:gPlayerReceivedWelcome[MAX_PLAYERS];
+
+new gAirdropTimer = -1;
+new bool:gAirdropActive = false;
+new gAirdropPickup = -1;
+new Float:gAirdropPos[3];
+new gCurrentHour = 10;
 
 forward SurvivalTick();
 forward ZombieTick();
 forward RespawnLoot(index);
 forward ApplyItemUsage(playerid, E_ITEM_TYPE:item);
+forward TriggerAirdrop();
 
 // -------------------- Вспомогательные функции --------------------
 stock Float:ClampFloat(Float:value, Float:minValue, Float:maxValue)
@@ -168,8 +207,14 @@ stock ResetPlayerSurvivalData(playerid)
     gPlayerHungryWarned[playerid] = false;
     gPlayerThirstWarned[playerid] = false;
     gPlayerInfectionWarned[playerid] = false;
+    gPlayerTemperature[playerid] = TEMPERATURE_NORMAL;
+    gPlayerColdWarned[playerid] = false;
+    gPlayerHeatWarned[playerid] = false;
+    gPlayerFreezing[playerid] = false;
+    gPlayerOverheating[playerid] = false;
+    gPlayerWarmUntil[playerid] = 0;
 
-    for (new item = 0; item < ITEM_COUNT; item++)
+    for (new E_ITEM_TYPE:item = ITEM_NONE; item < ITEM_COUNT; item++)
         gPlayerInventory[playerid][item] = 0;
 
     gPlayerInventory[playerid][ITEM_WATER] = 1;
@@ -209,7 +254,7 @@ stock E_ITEM_TYPE:GetItemTypeFromString(const input[])
     return ITEM_NONE;
 }
 
-stock RandomLootItem()
+stock E_ITEM_TYPE:RandomLootItem()
 {
     new roll = random(100);
     if (roll < 25) return ITEM_WATER;
@@ -226,7 +271,7 @@ stock CreateLootAtIndex(index)
     if (index < 0 || index >= LOOT_POINT_COUNT)
         return 0;
 
-    new item = RandomLootItem();
+    new E_ITEM_TYPE:item = RandomLootItem();
     gLootPoints[index][lootItem] = item;
     gLootPoints[index][lootActive] = true;
 
@@ -298,7 +343,8 @@ stock CleanupZombies()
 stock GiveStarterNotification(playerid)
 {
     SendClientMessage(playerid, COLOR_INFO, "Добро пожаловать в {FFFFFF}DayZ{A0D0FF}. Используй /help для списка команд.");
-    SendClientMessage(playerid, COLOR_INFO, "Выживи как можно дольше: следи за голодом, жаждой и избегай заражения.");
+    SendClientMessage(playerid, COLOR_INFO, "Следи за голодом, жаждой и температурой тела, чтобы не погибнуть от стихии.");
+    SendClientMessage(playerid, COLOR_INFO, "Красные дымовые ракеты согревают, а воздушные сбросы иногда приносят редкие припасы.");
     return 1;
 }
 
@@ -309,6 +355,20 @@ stock ShowPlayerStatus(playerid)
 
     new line[144];
     format(line, sizeof(line), "{C8FFC8}Здоровье: %.0f | Голод: %.0f%% | Жажда: %.0f%%", health, gPlayerHunger[playerid], gPlayerThirst[playerid]);
+    SendClientMessage(playerid, COLOR_INFO, line);
+
+    new bool:isWarm = (gPlayerWarmUntil[playerid] > GetTickCount());
+    new tempStatus[32];
+    if (isWarm)
+        format(tempStatus, sizeof(tempStatus), "согрет");
+    else if (gPlayerTemperature[playerid] <= TEMPERATURE_WARN_COLD)
+        format(tempStatus, sizeof(tempStatus), "холодно");
+    else if (gPlayerTemperature[playerid] >= TEMPERATURE_WARN_HOT)
+        format(tempStatus, sizeof(tempStatus), "жарко");
+    else
+        format(tempStatus, sizeof(tempStatus), "комфортно");
+
+    format(line, sizeof(line), "{9BD3FF}Температура: %.1f°C | Ощущения: %s | Время: %02d:00", gPlayerTemperature[playerid], tempStatus, gCurrentHour);
     SendClientMessage(playerid, COLOR_INFO, line);
 
     format(line, sizeof(line), "{FFCD82}Кровотечение: %s | Инфекция: %s", gPlayerBleeding[playerid] ? "да" : "нет", gPlayerInfected[playerid] ? "да" : "нет");
@@ -326,7 +386,7 @@ stock BuildInventoryString(playerid, dest[], len)
     dest[0] = '\0';
     new bool:first = true;
 
-    for (new item = 1; item < ITEM_COUNT; item++)
+    for (new E_ITEM_TYPE:item = ITEM_WATER; item < ITEM_COUNT; item++)
     {
         if (gPlayerInventory[playerid][item] > 0)
         {
@@ -374,7 +434,7 @@ stock GiveInventoryItem(playerid, E_ITEM_TYPE:item, amount)
 
 stock HandlePlayerDeath(playerid)
 {
-    for (new item = 0; item < ITEM_COUNT; item++)
+    for (new E_ITEM_TYPE:item = ITEM_NONE; item < ITEM_COUNT; item++)
         gPlayerInventory[playerid][item] = 0;
 
     gPlayerBleeding[playerid] = false;
@@ -383,6 +443,114 @@ stock HandlePlayerDeath(playerid)
     gPlayerHungryWarned[playerid] = false;
     gPlayerThirstWarned[playerid] = false;
     gPlayerInfectionWarned[playerid] = false;
+    gPlayerTemperature[playerid] = TEMPERATURE_NORMAL;
+    gPlayerColdWarned[playerid] = false;
+    gPlayerHeatWarned[playerid] = false;
+    gPlayerFreezing[playerid] = false;
+    gPlayerOverheating[playerid] = false;
+    gPlayerWarmUntil[playerid] = 0;
+    return 1;
+}
+
+stock ScheduleNextAirdrop()
+{
+    if (gAirdropTimer != -1)
+    {
+        KillTimer(gAirdropTimer);
+        gAirdropTimer = -1;
+    }
+
+    gAirdropTimer = SetTimer("TriggerAirdrop", AIRDROP_INTERVAL_MS, false);
+    return 1;
+}
+
+stock CleanupAirdrop()
+{
+    if (gAirdropActive && gAirdropPickup != -1)
+    {
+        DestroyPickup(gAirdropPickup);
+    }
+
+    gAirdropPickup = -1;
+    gAirdropActive = false;
+    gAirdropPos[0] = 0.0;
+    gAirdropPos[1] = 0.0;
+    gAirdropPos[2] = 0.0;
+    return 1;
+}
+
+stock GiveAirdropLoot(playerid)
+{
+    new found[ITEM_COUNT];
+
+    for (new i = 0; i < AIRDROP_ITEM_ROLLS; i++)
+    {
+        new roll = random(100);
+        new amount = 1 + random(2);
+        E_ITEM_TYPE:item;
+
+        if (roll < 20)
+            item = ITEM_MEDKIT;
+        else if (roll < 45)
+            item = ITEM_AMMO;
+        else if (roll < 65)
+            item = ITEM_FOOD;
+        else if (roll < 85)
+            item = ITEM_WATER;
+        else if (roll < 95)
+            item = ITEM_TOOLKIT;
+        else
+            item = ITEM_FLARE;
+
+        found[item] += amount;
+        GiveInventoryItem(playerid, item, amount);
+    }
+
+    new bool:gaveWeapon = false;
+    if (random(100) < 25)
+    {
+        GivePlayerWeapon(playerid, WEAPON_AK47, 90 + random(61));
+        gaveWeapon = true;
+    }
+
+    new summary[192];
+    new bool:first = true;
+    for (new E_ITEM_TYPE:item = ITEM_WATER; item < ITEM_COUNT; item++)
+    {
+        if (!found[item])
+            continue;
+
+        new itemName[32];
+        GetItemName(item, itemName, sizeof(itemName));
+
+        if (first)
+        {
+            format(summary, sizeof(summary), "%s x%d", itemName, found[item]);
+            first = false;
+        }
+        else
+        {
+            format(summary, sizeof(summary), "%s, %s x%d", summary, itemName, found[item]);
+        }
+    }
+
+    if (gaveWeapon)
+    {
+        if (first)
+            format(summary, sizeof(summary), "штурмовая винтовка");
+        else
+            format(summary, sizeof(summary), "%s и штурмовая винтовка", summary);
+    }
+
+    if (first && !gaveWeapon)
+        format(summary, sizeof(summary), "запас припасов");
+
+    new message[224];
+    format(message, sizeof(message), "Вы обыскали ящик с воздушным грузом и получили: %s.", summary);
+    SendClientMessage(playerid, COLOR_ACTION, message);
+    SendClientMessage(playerid, COLOR_INFO, "Припасы автоматически добавлены в инвентарь.");
+
+    GameTextForPlayer(playerid, "~g~Airdrop secured!", 3000, 3);
     return 1;
 }
 
@@ -403,7 +571,8 @@ public OnGameModeInit()
     EnableStuntBonusForAll(false);
     AllowInteriorWeapons(true);
     SetNameTagDrawDistance(25.0);
-    SetWorldTime(10);
+    gCurrentHour = 10;
+    SetWorldTime(gCurrentHour);
     SetWeather(9);
 
     for (new i = 0; i < sizeof(gSurvivorSpawns); i++)
@@ -416,6 +585,7 @@ public OnGameModeInit()
 
     gSurvivalTimer = SetTimer("SurvivalTick", SURVIVAL_TICK_MS, true);
     gZombieTimer = SetTimer("ZombieTick", ZOMBIE_TICK_MS, true);
+    ScheduleNextAirdrop();
 
     print("DayZ Survival gamemode успешно загружен.");
     return 1;
@@ -435,22 +605,39 @@ public OnGameModeExit()
         gZombieTimer = -1;
     }
 
+    if (gAirdropTimer != -1)
+    {
+        KillTimer(gAirdropTimer);
+        gAirdropTimer = -1;
+    }
+
     CleanupLootPoints();
     CleanupZombies();
+    CleanupAirdrop();
     return 1;
 }
 
 public OnPlayerConnect(playerid)
 {
     ResetPlayerSurvivalData(playerid);
-    GiveStarterNotification(playerid);
-    SendClientMessage(playerid, COLOR_INFO, "Используй /status для проверки состояния, /use [предмет] для использования.");
+    gPlayerReceivedWelcome[playerid] = false;
+
+    SendClientMessage(playerid, COLOR_INFO, "Вы подключились к DayZ Survival. Используй /help для списка механик.");
+    SendClientMessage(playerid, COLOR_INFO, "Выживи любой ценой: следи за голодом, жаждой, инфекциями и температурой тела.");
+
+    if (gAirdropActive)
+    {
+        new dropMessage[144];
+        format(dropMessage, sizeof(dropMessage), "Текущий воздушный сброс находится около координат %.0f %.0f.", gAirdropPos[0], gAirdropPos[1]);
+        SendClientMessage(playerid, COLOR_ACTION, dropMessage);
+    }
     return 1;
 }
 
 public OnPlayerDisconnect(playerid, reason)
 {
-    HandlePlayerDeath(playerid);
+    ResetPlayerSurvivalData(playerid);
+    gPlayerReceivedWelcome[playerid] = false;
     return 1;
 }
 
@@ -471,14 +658,22 @@ public OnPlayerSpawn(playerid)
     SetPlayerPos(playerid, gSurvivorSpawns[spawnIndex][0], gSurvivorSpawns[spawnIndex][1], gSurvivorSpawns[spawnIndex][2]);
     SetPlayerFacingAngle(playerid, gSurvivorSpawns[spawnIndex][3]);
     SetPlayerHealth(playerid, 100.0);
-    SetPlayerArmor(playerid, 0.0);
+    SetPlayerArmour(playerid, 0.0);
     ResetPlayerWeapons(playerid);
 
-    GiveStarterNotification(playerid);
+    if (!gPlayerReceivedWelcome[playerid])
+    {
+        GiveStarterNotification(playerid);
+        gPlayerReceivedWelcome[playerid] = true;
+    }
+    else
+    {
+        SendClientMessage(playerid, COLOR_INFO, "Новая жизнь началась. Поиск припасов и тепло помогут вам выжить дольше.");
+    }
     return 1;
 }
 
-public OnPlayerDeath(playerid, killerid, reason)
+public OnPlayerDeath(playerid, killerid, WEAPON:reason)
 {
     HandlePlayerDeath(playerid);
     SendClientMessage(playerid, COLOR_DANGER, "Вы погибли и потеряли все припасы. Попробуйте ещё раз!");
@@ -495,8 +690,24 @@ public OnPlayerCommandText(playerid, cmdtext[])
 
     if (!strcmp(cmdtext, "/help", true))
     {
-        SendClientMessage(playerid, COLOR_INFO, "Доступные команды: /status, /use [предмет], /craft flare, /craft ammo");
-        SendClientMessage(playerid, COLOR_INFO, "Примеры: /use вода, /use bandage, /craft flare");
+        SendClientMessage(playerid, COLOR_INFO, "Доступные команды: /status, /inventory, /use [предмет], /craft flare, /craft ammo, /airdrop");
+        SendClientMessage(playerid, COLOR_INFO, "Примеры: /use вода, /craft flare, /airdrop");
+        SendClientMessage(playerid, COLOR_INFO, "Факелы согревают от холода, а воздушные сбросы дают редкие припасы.");
+        return 1;
+    }
+
+    if (!strcmp(cmdtext, "/airdrop", true))
+    {
+        if (gAirdropActive)
+        {
+            new message[144];
+            format(message, sizeof(message), "Воздушный ящик падает недалеко от координат %.0f %.0f.", gAirdropPos[0], gAirdropPos[1]);
+            SendClientMessage(playerid, COLOR_ACTION, message);
+        }
+        else
+        {
+            SendClientMessage(playerid, COLOR_INFO, "Самолёт пока не замечен. Следите за небом и слушайте сирены.");
+        }
         return 1;
     }
 
@@ -596,6 +807,22 @@ public OnPlayerCommandText(playerid, cmdtext[])
 
 public OnPlayerPickUpPickup(playerid, pickupid)
 {
+    if (gAirdropActive && pickupid == gAirdropPickup)
+    {
+        GiveAirdropLoot(playerid);
+
+        new playerName[MAX_PLAYER_NAME];
+        GetPlayerName(playerid, playerName, sizeof(playerName));
+
+        new message[160];
+        format(message, sizeof(message), "%s обезопасил воздушный сброс и забрал припасы!", playerName);
+        SendClientMessageToAll(COLOR_ACTION, message);
+
+        CleanupAirdrop();
+        ScheduleNextAirdrop();
+        return 1;
+    }
+
     for (new i = 0; i < LOOT_POINT_COUNT; i++)
     {
         if (!gLootPoints[i][lootActive])
@@ -603,14 +830,14 @@ public OnPlayerPickUpPickup(playerid, pickupid)
 
         if (gLootPoints[i][lootPickup] == pickupid)
         {
-            new item = gLootPoints[i][lootItem];
+            new E_ITEM_TYPE:item = gLootPoints[i][lootItem];
             if (item <= ITEM_NONE || item >= ITEM_COUNT)
                 return 1;
 
-            GiveInventoryItem(playerid, E_ITEM_TYPE:item, 1);
+            GiveInventoryItem(playerid, item, 1);
 
             new itemName[32];
-            GetItemName(E_ITEM_TYPE:item, itemName, sizeof(itemName));
+            GetItemName(item, itemName, sizeof(itemName));
 
             new message[96];
             format(message, sizeof(message), "Вы нашли %s", itemName);
@@ -624,7 +851,7 @@ public OnPlayerPickUpPickup(playerid, pickupid)
     return 1;
 }
 
-public OnPlayerTakeDamage(playerid, issuerid, Float:amount, weaponid, bodypart)
+public OnPlayerTakeDamage(playerid, issuerid, Float:amount, WEAPON:weaponid, bodypart)
 {
     if (amount >= 15.0 && !gPlayerBleeding[playerid] && random(100) < 40)
     {
@@ -640,14 +867,22 @@ stock ApplyItemUsage(playerid, E_ITEM_TYPE:item)
 {
     switch (item)
     {
+        case ITEM_NONE:
+        {
+            SendClientMessage(playerid, COLOR_WARNING, "Предмет не найден.");
+        }
         case ITEM_WATER:
         {
             gPlayerThirst[playerid] = ClampFloat(gPlayerThirst[playerid] + 45.0, 0.0, 100.0);
-            SendClientMessage(playerid, COLOR_ACTION, "Вы утолили жажду.");
+            gPlayerTemperature[playerid] = ClampFloat(gPlayerTemperature[playerid] - 0.5, TEMPERATURE_MINIMUM, TEMPERATURE_MAXIMUM);
+            if (gPlayerTemperature[playerid] <= TEMPERATURE_WARN_COLD)
+                gPlayerColdWarned[playerid] = false;
+            SendClientMessage(playerid, COLOR_ACTION, "Вы утолили жажду и освежились.");
         }
         case ITEM_FOOD:
         {
             gPlayerHunger[playerid] = ClampFloat(gPlayerHunger[playerid] + 35.0, 0.0, 100.0);
+            gPlayerTemperature[playerid] = ClampFloat(gPlayerTemperature[playerid] + 0.2, TEMPERATURE_MINIMUM, TEMPERATURE_MAXIMUM);
             SendClientMessage(playerid, COLOR_ACTION, "Вы перекусили консервами.");
         }
         case ITEM_BANDAGE:
@@ -679,8 +914,8 @@ stock ApplyItemUsage(playerid, E_ITEM_TYPE:item)
         }
         case ITEM_AMMO:
         {
-            new weapon = GetPlayerWeapon(playerid);
-            if (weapon == 0 || weapon == WEAPON_FIST)
+            new WEAPON:weapon = GetPlayerWeapon(playerid);
+            if (weapon == WEAPON:0 || weapon == WEAPON_FIST)
             {
                 GivePlayerWeapon(playerid, WEAPON_COLT45, 30);
                 SendClientMessage(playerid, COLOR_ACTION, "Вы нашли старый пистолет вместе с патронами.");
@@ -710,7 +945,15 @@ stock ApplyItemUsage(playerid, E_ITEM_TYPE:item)
             new Float:x, Float:y, Float:z;
             GetPlayerPos(playerid, x, y, z);
             CreateExplosion(x, y, z, 3, 2.0);
-            SendClientMessage(playerid, COLOR_ACTION, "Вы подожгли сигнальную шашку, зомби услышали шум!");
+            gPlayerWarmUntil[playerid] = GetTickCount() + WARM_BUFF_DURATION_MS;
+            gPlayerTemperature[playerid] = ClampFloat(gPlayerTemperature[playerid] + 1.5, TEMPERATURE_MINIMUM, TEMPERATURE_MAXIMUM);
+            gPlayerColdWarned[playerid] = false;
+            gPlayerFreezing[playerid] = false;
+            SendClientMessage(playerid, COLOR_ACTION, "Вы подожгли сигнальную шашку: рядом стало теплее, но шум привлекает зомби!");
+        }
+        default:
+        {
+            SendClientMessage(playerid, COLOR_WARNING, "Этот предмет пока нельзя использовать.");
         }
     }
     return 1;
@@ -719,13 +962,18 @@ stock ApplyItemUsage(playerid, E_ITEM_TYPE:item)
 // -------------------- Таймеры --------------------
 public SurvivalTick()
 {
+    gCurrentHour = (gCurrentHour + 1) % 24;
+    SetWorldTime(gCurrentHour);
+
+    new currentTick = GetTickCount();
+
     for (new playerid = 0; playerid < MAX_PLAYERS; playerid++)
     {
         if (!IsPlayerConnected(playerid))
             continue;
 
-        new state = GetPlayerState(playerid);
-        if (state != PLAYER_STATE_ONFOOT && state != PLAYER_STATE_DRIVER && state != PLAYER_STATE_PASSENGER)
+        new PLAYER_STATE:playerState = GetPlayerState(playerid);
+        if (playerState != PLAYER_STATE_ONFOOT && playerState != PLAYER_STATE_DRIVER && playerState != PLAYER_STATE_PASSENGER)
             continue;
 
         gPlayerHunger[playerid] = ClampFloat(gPlayerHunger[playerid] - 2.0, 0.0, 100.0);
@@ -800,6 +1048,107 @@ public SurvivalTick()
             gPlayerInfectionWarned[playerid] = false;
         }
 
+        new bool:isWarm = false;
+        if (gPlayerWarmUntil[playerid] != 0)
+        {
+            if (currentTick >= gPlayerWarmUntil[playerid])
+            {
+                gPlayerWarmUntil[playerid] = 0;
+                SendClientMessage(playerid, COLOR_INFO, "Согревающий эффект сигнальной шашки закончился.");
+            }
+            else
+            {
+                isWarm = true;
+            }
+        }
+
+        new bool:isNight = (gCurrentHour < 6 || gCurrentHour >= 21);
+        new Float:temperatureDelta = -0.12;
+
+        if (isNight)
+            temperatureDelta -= 0.18;
+        else if (gCurrentHour >= 12 && gCurrentHour <= 15)
+            temperatureDelta += 0.18;
+        else if (gCurrentHour >= 16 && gCurrentHour <= 18)
+            temperatureDelta += 0.05;
+
+        if (isWarm)
+            temperatureDelta += 0.60;
+
+        if (IsPlayerInAnyVehicle(playerid))
+            temperatureDelta += 0.05;
+
+        new Float:vx, Float:vy, Float:vz;
+        GetPlayerVelocity(playerid, vx, vy, vz);
+        new Float:speed = floatsqroot(vx * vx + vy * vy + vz * vz);
+        if (speed > 0.30)
+            temperatureDelta += 0.08;
+        if (speed > 1.00)
+            temperatureDelta += 0.05;
+
+        if (!isWarm && isNight && random(100) < 15)
+            temperatureDelta -= 0.15;
+
+        gPlayerTemperature[playerid] = ClampFloat(gPlayerTemperature[playerid] + temperatureDelta, TEMPERATURE_MINIMUM, TEMPERATURE_MAXIMUM);
+
+        if (gPlayerTemperature[playerid] <= TEMPERATURE_WARN_COLD)
+        {
+            if (!gPlayerColdWarned[playerid])
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "Вы начинаете замерзать. Найдите укрытие или источник тепла.");
+                gPlayerColdWarned[playerid] = true;
+            }
+        }
+        else if (gPlayerColdWarned[playerid] && gPlayerTemperature[playerid] > TEMPERATURE_WARN_COLD + 0.8)
+        {
+            SendClientMessage(playerid, COLOR_INFO, "Вам стало теплее.");
+            gPlayerColdWarned[playerid] = false;
+        }
+
+        if (gPlayerTemperature[playerid] >= TEMPERATURE_WARN_HOT)
+        {
+            if (!gPlayerHeatWarned[playerid])
+            {
+                SendClientMessage(playerid, COLOR_WARNING, "Жара растёт. Найдите тень или выпейте воды.");
+                gPlayerHeatWarned[playerid] = true;
+            }
+        }
+        else if (gPlayerHeatWarned[playerid] && gPlayerTemperature[playerid] < TEMPERATURE_WARN_HOT - 0.7)
+        {
+            SendClientMessage(playerid, COLOR_INFO, "Температура тела стабилизировалась.");
+            gPlayerHeatWarned[playerid] = false;
+        }
+
+        if (gPlayerTemperature[playerid] <= TEMPERATURE_DAMAGE_COLD)
+        {
+            health = ClampFloat(health - TEMPERATURE_DAMAGE_AMOUNT, 0.0, 100.0);
+            if (!gPlayerFreezing[playerid])
+            {
+                SendClientMessage(playerid, COLOR_DANGER, "Вы замерзаете! Разведите огонь или используйте сигнальную шашку.");
+                gPlayerFreezing[playerid] = true;
+            }
+        }
+        else if (gPlayerFreezing[playerid] && gPlayerTemperature[playerid] > TEMPERATURE_WARN_COLD + 0.4)
+        {
+            SendClientMessage(playerid, COLOR_INFO, "Кровь снова циркулирует, вы перестали замерзать.");
+            gPlayerFreezing[playerid] = false;
+        }
+
+        if (gPlayerTemperature[playerid] >= TEMPERATURE_DAMAGE_HOT)
+        {
+            health = ClampFloat(health - (TEMPERATURE_DAMAGE_AMOUNT - 1.0), 0.0, 100.0);
+            if (!gPlayerOverheating[playerid])
+            {
+                SendClientMessage(playerid, COLOR_DANGER, "Тепловой удар! Охладитесь водой и укрытием.");
+                gPlayerOverheating[playerid] = true;
+            }
+        }
+        else if (gPlayerOverheating[playerid] && gPlayerTemperature[playerid] < TEMPERATURE_WARN_HOT - 0.2)
+        {
+            SendClientMessage(playerid, COLOR_INFO, "Жара спала, дыхание выровнялось.");
+            gPlayerOverheating[playerid] = false;
+        }
+
         SetPlayerHealth(playerid, health);
 
         if (health <= 0.0)
@@ -807,6 +1156,45 @@ public SurvivalTick()
             SetPlayerHealth(playerid, 0.0);
         }
     }
+    return 1;
+}
+
+public TriggerAirdrop()
+{
+    if (gAirdropActive)
+        return 1;
+
+    new bool:hasActivePlayer = false;
+    for (new playerid = 0; playerid < MAX_PLAYERS; playerid++)
+    {
+        if (!IsPlayerConnected(playerid))
+            continue;
+
+        if (GetPlayerState(playerid) == PLAYER_STATE_WASTED)
+            continue;
+
+        hasActivePlayer = true;
+        break;
+    }
+
+    if (!hasActivePlayer)
+    {
+        ScheduleNextAirdrop();
+        return 1;
+    }
+
+    new location = random(sizeof(gAirdropLocations));
+    gAirdropPos[0] = gAirdropLocations[location][0];
+    gAirdropPos[1] = gAirdropLocations[location][1];
+    gAirdropPos[2] = gAirdropLocations[location][2];
+
+    gAirdropPickup = CreatePickup(AIRDROP_MODEL, 2, gAirdropPos[0], gAirdropPos[1], gAirdropPos[2], -1);
+    gAirdropActive = true;
+
+    new message[144];
+    format(message, sizeof(message), "Самолёт сбросил груз у координат %.0f %.0f. Дым виден издалека!", gAirdropPos[0], gAirdropPos[1]);
+    SendClientMessageToAll(COLOR_ACTION, message);
+    SendClientMessageToAll(COLOR_INFO, "Доберитесь до ящика как можно скорее, пока его не нашли другие выжившие.");
     return 1;
 }
 
