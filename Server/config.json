@@ -95,12 +95,9 @@
     },
     "password": "",
     "pawn": {
-        "legacy_plugins": [
-            "json",
-            "requests"
-        ],
+        "legacy_plugins": [],
         "main_scripts": [
-            "dayz"
+            "gungame 1"
         ],
         "side_scripts": []
     },
