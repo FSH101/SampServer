@@ -97,7 +97,7 @@
     "pawn": {
         "legacy_plugins": [],
         "main_scripts": [
-            "gungame 1"
+            "roleplay 1"
         ],
         "side_scripts": []
     },
