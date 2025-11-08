@@ -1,0 +1,34 @@
+<resources>
+    <string name="app_name">SA-MP Launcher</string>
+    <string name="play">Играть</string>
+    <string name="resources">Ресурсы</string>
+    <string name="settings">Настройки</string>
+    <string name="repair_files">Починить файлы</string>
+    <string name="check_updates">Проверить обновления</string>
+    <string name="nickname">Никнейм</string>
+    <string name="password">Пароль</string>
+    <string name="select_client_folder">Выбрать папку клиента</string>
+    <string name="auto_launch">Автозапуск клиента после обновления</string>
+    <string name="no_client_title">Клиент не установлен</string>
+    <string name="no_client_description">Не удалось найти установленный SA-MP клиент. Установите один из поддерживаемых пакетов и повторите.</string>
+    <string name="open_client_page">Открыть страницу клиента</string>
+    <string name="retry">Повторить проверку</string>
+    <string name="server_address_label">Сервер: 141.95.190.144:1453</string>
+    <string name="manifest_idle">Нажмите «Проверить обновления»</string>
+    <string name="manifest_error">Не удалось загрузить манифест</string>
+    <string name="manifest_up_to_date">Ресурсы актуальны</string>
+    <string name="manifest_update_available">Доступны обновления</string>
+    <string name="manifest_sync_in_progress">Синхронизация ресурсов…</string>
+    <string name="manifest_sync_failed">Синхронизация завершилась ошибкой</string>
+    <string name="manifest_sync_completed">Ресурсы обновлены</string>
+    <string name="nick_placeholder">Player</string>
+    <string name="password_placeholder">Необязательно</string>
+    <string name="missing_saf_permission">Выберите папку клиента SA-MP</string>
+    <string name="request_permission">Запросить доступ</string>
+    <string name="log_share_title">Поделиться логом</string>
+    <string name="cancel">Отмена</string>
+    <string name="confirm">Подтвердить</string>
+    <string name="download_speed">Скорость: %1$s</string>
+    <string name="download_progress">%1$d%% (%2$s / %3$s)</string>
+    <string name="file_count_progress">%1$d из %2$d</string>
+</resources>
